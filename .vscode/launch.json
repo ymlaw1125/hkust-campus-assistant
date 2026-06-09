@@ -13,7 +13,10 @@
                 "pattern": "(started|listening|Running|Serving) (at|on) (https?://\\S+)",
                 "action": "startDebugging",
                 "name": "Start Microsoft 365 Agents Playground"
-            }
+            },
+            "env": {
+                "PATH": "C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin;${env:PATH}"
+            },
         },
         {
             "name": "Start Microsoft 365 Agents Playground",

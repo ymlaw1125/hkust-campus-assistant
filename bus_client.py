@@ -216,6 +216,8 @@ async def test():
     results = await get_all_hkust_etas("from")
     print(format_etas_for_agent(results))
 
+# Pre-load on import so first query doesn't time out
+_hketa = HKEta()
 
 if __name__ == "__main__":
-    asyncio.run(generate_route_stops_summary())
+    asyncio.run(test())

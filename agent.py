@@ -7,7 +7,8 @@ from azure.identity import AzureCliCredential, get_bearer_token_provider
 from agent_interface import AgentInterface
 from microsoft_agents.hosting.core import Authorization, TurnContext
 from bus_client import get_all_hkust_etas, format_etas_for_agent
-
+from library_client import get_available_rooms, get_availability_for_range, format_availability_for_agent, format_range_for_agent
+from datetime import datetime 
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -63,7 +64,22 @@ ROUTING RULES:
 - ONLY use [LIVE BUS DATA] for ETAs — never invent bus times
 - When [LIVE BUS DATA] is provided, always show the actual times
 
-When you receive [LIVE BUS DATA], use those exact times to answer."""
+When you receive [LIVE BUS DATA], use those exact times to answer.
+
+LIBRARY ROOMS (HKUST Library, lbbooking.ust.hk):
+- Study Rooms (LC-S1 to LC-S18): LG1 floor, 6-person, TV screen + whiteboard, 1-hour slots
+- Study Pods (Pod-1 to Pod-12): LG1 floor, 1-person, power + USB charging, 30-min slots  
+- Nap Pods (Nap-1 to Nap-4): LG1 floor, 1-person reclining, limited availability
+- Opening hours: 8:00am–11:00pm daily
+- Booking URL: https://lbbooking.ust.hk
+
+LIBRARY RESPONSE RULES:
+- NEVER dump all room data unless explicitly asked for a full list
+- When showing availability, be concise: mention how many rooms/pods are free and name 2-3 examples
+- Always consider current time — if it's late in an hour, prioritize the NEXT hour's availability
+- If [LIVE LIBRARY DATA] shows multiple slots, summarize them smartly: "3 slots available in the next 4 hours"
+- Always end library responses with the booking URL
+- Never invent room availability — only use [LIVE LIBRARY DATA]"""
     
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -148,7 +164,39 @@ When you receive [LIVE BUS DATA], use those exact times to answer."""
                 if direction_label:
                     etas = await get_all_hkust_etas("to" if "TO" in direction_label else "from")
                     extra_context = f"\n\n[LIVE BUS DATA - {direction_label}]\n{format_etas_for_agent(etas)}"
+            
+            # Check if library-related
+            library_keywords = ["room", "study room", "pod", "nap", "library", "book", "lc-s", "available", "free room", "study space", "quiet", "space", "seat"]
+            is_library_query = any(k in message_lower for k in library_keywords)
 
+            if is_library_query:
+                now = datetime.now()
+                date_str = now.strftime("%Y-%m-%d")
+                current_hour = now.hour
+                current_minute = now.minute
+
+                # Check if asking about a specific time
+                import re
+                time_match = re.search(r'\b(\d{1,2})(?::\d{2})?\s*(pm|am)?\b', message_lower)
+                if time_match:
+                    h = int(time_match.group(1))
+                    meridiem = time_match.group(2)
+                    if meridiem == "pm" and h < 12:
+                        h += 12
+                    elif meridiem == "am" and h == 12:
+                        h = 0
+                    # Show requested hour + next 2 hours
+                    slots = get_availability_for_range(date_str, h, 3)
+                    extra_context += f"\n\n[LIVE LIBRARY DATA]\n{format_range_for_agent(slots)}\nFor full room list at a specific hour, ask me."
+                else:
+                    # Smart default: if >45 min into current hour, start from next hour
+                    start_hour = current_hour + 1 if current_minute >= 45 else current_hour
+                    slots = get_availability_for_range(date_str, start_hour, 4)
+                    slot_details = get_available_rooms(date_str, start_hour)
+                    extra_context += f"\n\n[LIVE LIBRARY DATA - current time is {current_hour:02d}:{current_minute:02d}]\n"
+                    extra_context += f"Next available slots:\n{format_range_for_agent(slots)}\n"
+                    extra_context += f"\nFull room list for {start_hour:02d}:00:\n{format_availability_for_agent(slot_details)}"
+                    
             # Build message with live data injected
             user_content = message
             if extra_context:

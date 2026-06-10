@@ -24,6 +24,20 @@ logger = logging.getLogger(__name__)
 class AgentFrameworkAgent(AgentInterface):
     AGENT_PROMPT = """You are a helpful HKUST campus assistant helping students with bus transport and campus facilities.
 
+    BUS STOP LOCATIONS AT HKUST:
+- NORTH GATE: 91M (towards Po Lam / Hang Hau), 11, 11M, 12, 792M
+- SOUTH GATE: 91M (towards Diamond Hill / Choi Hung), 11
+
+BOARDING RULES:
+- Taking 91M to Diamond Hill or Choi Hung? → South Gate
+- Taking 91M to Hang Hau or Po Lam? → North Gate
+- Taking 11M to Hang Hau? → North Gate
+- Taking 792M to TKO or Sai Kung? → North Gate
+- Taking 12 to Po Lam or Sai Kung? → North Gate
+- Taking 11 towards Choi Hung? → South Gate
+- Taking 11 towards Hang Hau? → North Gate
+- Always specify the correct gate when giving directions
+
 BUSES SERVING HKUST — ONLY these 5 routes exist, do not invent others:
 - Route 91M: KMB bus — Diamond Hill MTR ↔ HKUST ↔ Po Lam
 - Route 11: GMB minibus — Choi Hung MTR ↔ HKUST ↔ Hang Hau Village
@@ -31,32 +45,12 @@ BUSES SERVING HKUST — ONLY these 5 routes exist, do not invent others:
 - Route 12: GMB minibus — Po Lam ↔ HKUST ↔ Sai Kung
 - Route 792M: Citybus — Tseung Kwan O Station ↔ HKUST ↔ Sai Kung
 
-FULL STOP LISTS (use these to answer questions about intermediate stops):
-
-Route 91M (to terminus):
-  DIAMOND HILL STATION → LUNG POON COURT → TAI YAU STREET SAN PO KONG → CHOI HUNG BBI → NGAU CHI WAN BBI → GOOD HOPE SCHOOL → ANDERSON ROAD → DENON TERRACE → TSENG LAN SHUE → PAK SHEK WO → PIK UK → TA KU LING SAN TSUEN → TAI PO TSAI KAU → H.K.U.S.T. NORTH → TAI PO TSAI VILLAGE → NGAN YING ROAD → SHUI BIN TSUEN → BOON KIN VILLAGE → MING TAK ESTATE → EAST POINT CITY → HANG HAU STATION → HAU TAK ESTATE → KING LAM ESTATE → METRO CITY → PO LAM
-Route 91M (reverse):
-  PO LAM → KING LAM ESTATE → HAU TAK ESTATE → EAST POINT CITY → HANG HAU STATION → TSEUNG KWAN O HOSPITAL → SHUI BIN TSUEN → YING YIP ROAD → NGAN YING ROAD → H.K.U.S.T. SOUTH → TAI PO TSAI → TAI PO TSAI KAU → PIK UK → PAK SHEK WO → TSENG LAN SHUE → GOOD HOPE SCHOOL → CHOI WAN ESTATE → CHOI HUNG STATION → DIAMOND HILL STATION
-
-Route 11 (to terminus):
-  Ngau Chi Wan → Choi Wan → Good Hope School → Denon Terrace → Tseng Lan Shue → Pik Uk → Ta Ku Ling San Tsuen → Tai Po Tsai Kau → HKUST North → Tai Po Tsai Tsuen → Shui Pin Tsuen → Boon Kin Village → TKO Hospital → East Point City → Hang Hau Station → Hang Hau Village
-Route 11 (reverse):
-  Hang Hau Village → Hang Hau Station → Hang Hau North → HKUST South → Tai Po Tsai Tsuen → Tai Po Tsai Kau → Ta Ku Ling San Tsuen → Pik Uk → Pak Shek Wo → Tseng Lan Shue → Good Hope School → Choi Wan → Ping Shek Estate → Choi Hung Estate
-
-Route 11M (to terminus):
-  Hang Hau Station → Tai Po Tsai Tsuen → HKUST
-Route 11M (reverse):
-  HKUST → Tai Po Tsai Tsuen → Shui Pin Tsuen → Boon Kin Village → TKO Hospital → Hau Tak Estate → Hang Hau Station
-
-Route 12 (to terminus):
-  Po Lam → Sau Mau Ping → Shun Lee → Tseng Lan Shue → Pik Uk → Ta Ku Ling San Tsuen → Tai Po Tsai Kau → HKUST → Hiram's Highway → Marina Cove → Hebe Haven → Pak Kong → Po Lo Che → Lakeside Garden → Sai Kung
-Route 12 (reverse):
-  Sai Kung → Lakeside Garden → Pak Kong → Hebe Haven → Marina Cove → HKUST → Pik Uk → Tseng Lan Shue → Sau Mau Ping → Po Lam
-
-Route 792M (to terminus):
-  Tseung Kwan O Station → Tong Ming Street → Tiu Keng Leng Station → Kin Ming Estate → TKO Hospital → St Vincent Catholic Church → Shui Bin Tsuen → Ying Yip Road → Ngan Ying Road → Tai Po Tsai Village → HKUST → Tai Po Tsai Kau → Wo Mei → Nam Pin Wai → Ho Chung → Pak Wai → Fisherman Village → Pak Sha Wan → Habitat → Pak Kong → Po Lo Che → Lakeside Garden → Sai Kung
-Route 792M (reverse):
-  Sai Kung → Lakeside Garden → Po Lo Che → Pak Kong → Pak Sha Wan → Fisherman Village → Pak Wai → Marina Cove → Nam Pin Wai → Wo Mei → Tai Po Tsai Kau → HKUST → Tai Po Tsai Village → Ngan Ying Road → Shui Bin Tsuen → Boon Kin Village → TKO Hospital → Hau Tak Estate → Tiu Keng Leng Station → Tseung Kwan O Station
+FULL STOP LISTS (key stops only):
+Route 91M: Diamond Hill ↔ Choi Hung ↔ Good Hope School ↔ Tseng Lan Shue ↔ Pik Uk ↔ Tai Po Tsai ↔ HKUST ↔ Hang Hau ↔ Po Lam
+Route 11: Choi Hung MTR ↔ Good Hope School ↔ Tseng Lan Shue ↔ Pik Uk ↔ Tai Po Tsai ↔ HKUST ↔ Boon Kin Village ↔ TKO Hospital ↔ Hang Hau ↔ Hang Hau Village
+Route 11M: Hang Hau MTR ↔ Tai Po Tsai ↔ HKUST
+Route 12: Po Lam ↔ Sau Mau Ping ↔ Shun Lee ↔ Tseng Lan Shue ↔ Pik Uk ↔ Tai Po Tsai ↔ HKUST ↔ Marina Cove ↔ Hebe Haven ↔ Pak Kong ↔ Sai Kung
+Route 792M: TKO Station ↔ Tiu Keng Leng ↔ TKO Hospital ↔ Shui Bin Tsuen ↔ Tai Po Tsai ↔ HKUST ↔ Wo Mei ↔ Nam Pin Wai ↔ Pak Kong ↔ Sai Kung
 
 ROUTING RULES:
 - Check the stop lists above before saying a destination has no service
@@ -88,7 +82,17 @@ LIBRARY RESPONSE RULES:
 - If a student asks about a specific room like LC-4, check if it appears in the data
 - If [LIVE LIBRARY DATA] shows multiple slots, summarize them smartly: "3 slots available in the next 4 hours"
 - Always end library responses with the booking URL
-- Never invent room availability — only use [LIVE LIBRARY DATA]"""
+- Never invent room availability — only use [LIVE LIBRARY DATA]
+
+RESPONSE STYLE RULES:
+- Be concise. Give the answer directly. No "let me check...", no "actually", no thinking out loud.
+- Never show your reasoning process — just give the result, unless the user specifies.
+- If a question is ambiguous (e.g. "last 91M bus from HKUST" could mean to Diamond Hill or Po Lam), ask ONE short clarifying question before answering. Example: "Which direction — towards Diamond Hill or Po Lam?"
+- If someone asks about buses without specifying direction, ask which direction first.
+- Keep responses short. Use bullet points only when listing multiple items.
+- Never explain what you're about to do — just do it.
+- Never say "based on the live data" or "from the data I have" — just give the answer.
+"""
     
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -151,29 +155,28 @@ LIBRARY RESPONSE RULES:
 
             extra_context = ""
             if is_bus_query:
-                # Determine direction from message
-                to_keywords = ["to hkust", "to campus", "going to school", "get to hkust", "arrive at hkust", "reach hkust"]
-                from_keywords = ["from hkust", "leave hkust", "leaving campus", "going home", "from campus"]
+                # Detect destination from message
+                dest_keywords = {
+                    "diamond_hill": ["diamond hill", "diamond", "kowloon", "choi hung", "choi hung mtr"],
+                    "po_lam": ["po lam", "po lam mtr"],
+                    "hang_hau": ["hang hau", "hang hau mtr", "tko gateway", "east point"],
+                    "tko": ["tseung kwan o", "tko", "popcorn", "tiu keng leng"],
+                    "sai_kung": ["sai kung", "marina cove", "hiram"],
+                    "to_hkust": ["to ust", "to hkust", "to campus", "to school", "get to hkust", "going to hkust", "going to school", "heading to hkust"],
+                }
 
-                if any(k in message_lower for k in from_keywords):
-                    etas = await get_all_hkust_etas("from")
-                    direction_label = "FROM HKUST"
-                elif any(k in message_lower for k in to_keywords):
-                    etas = await get_all_hkust_etas("to")
-                    direction_label = "TO HKUST"
-                else:
-                    # Fetch both directions
-                    etas_to = await get_all_hkust_etas("to")
-                    etas_from = await get_all_hkust_etas("from")
-                    to_str = format_etas_for_agent(etas_to)
-                    from_str = format_etas_for_agent(etas_from)
-                    extra_context = f"\n\n[LIVE BUS DATA]\nBuses TO HKUST:\n{to_str}\n\nBuses FROM HKUST:\n{from_str}"
-                    direction_label = None
+                matched_filter = "all"
+                for filter_key, keywords in dest_keywords.items():
+                    if any(k in message_lower for k in keywords):
+                        matched_filter = filter_key
+                        break
+                        
+                if matched_filter == "to_hkust":
+                    matched_filter = "hkust"
 
-                if direction_label:
-                    etas = await get_all_hkust_etas("to" if "TO" in direction_label else "from")
-                    extra_context = f"\n\n[LIVE BUS DATA - {direction_label}]\n{format_etas_for_agent(etas)}"
-            
+                etas = await get_all_hkust_etas(matched_filter)
+                extra_context += f"\n\n[LIVE BUS DATA]\n{format_etas_for_agent(etas)}"
+
             # Check if library-related
             library_keywords = ["room", "study room", "learning commons", "lc-", "lg1", "lg3", "lg4", "1f", "pod", "nap", "library", "book", "available", "free room", "study space", "quiet", "space", "seat", "study"]
             is_library_query = any(k in message_lower for k in library_keywords)

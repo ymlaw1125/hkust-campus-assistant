@@ -1,3 +1,4 @@
+from datetime import datetime 
 import logging
 import os
 from typing import Optional
@@ -7,8 +8,14 @@ from azure.identity import AzureCliCredential, get_bearer_token_provider
 from agent_interface import AgentInterface
 from microsoft_agents.hosting.core import Authorization, TurnContext
 from bus_client import get_all_hkust_etas, format_etas_for_agent
-from library_client import get_available_rooms, get_availability_for_range, format_availability_for_agent, format_range_for_agent
-from datetime import datetime 
+from library_client import (
+    get_slot_availability,
+    get_slots_range,
+    find_rooms_free_until,
+    format_slot_for_agent,
+    format_range_for_agent,
+    format_continuous_for_agent,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -67,16 +74,18 @@ ROUTING RULES:
 When you receive [LIVE BUS DATA], use those exact times to answer.
 
 LIBRARY ROOMS (HKUST Library, lbbooking.ust.hk):
-- Study Rooms (LC-S1 to LC-S18): LG1 floor, 6-person, TV screen + whiteboard, 1-hour slots
-- Study Pods (Pod-1 to Pod-12): LG1 floor, 1-person, power + USB charging, 30-min slots  
-- Nap Pods (Nap-1 to Nap-4): LG1 floor, 1-person reclining, limited availability
+- Learning Commons (LC-1 to LC-18): LG1 floor. LC-1 to LC-13 seat 7 people, LC-14 to LC-17 seat 10 people, LC-18 seats 6 people. Bookable in 30-min slots, max 4 slots (2 hours) per booking.
+- Library Study Rooms: Smaller rooms on 1/F (1F-R1 to R4), LG1 (LG1-R1 to R9), LG3 (LG3-R1 to R9), LG4 (LG4-R1 to R11). All seat ~4 people.
 - Opening hours: 8:00am–11:00pm daily
 - Booking URL: https://lbbooking.ust.hk
 
 LIBRARY RESPONSE RULES:
 - NEVER dump all room data unless explicitly asked for a full list
-- When showing availability, be concise: mention how many rooms/pods are free and name 2-3 examples
+- When showing availability, be concise: mention how many rooms/pods are free and name 2-3 preferred ones, e.g. "3 study rooms free, including LC-5, LC-14, and LG1-R3"
 - Always consider current time — if it's late in an hour, prioritize the NEXT hour's availability
+- When asked "free from X to Y", use the continuously free data provided
+- When asked about a specific time, show that slot's availability
+- If a student asks about a specific room like LC-4, check if it appears in the data
 - If [LIVE LIBRARY DATA] shows multiple slots, summarize them smartly: "3 slots available in the next 4 hours"
 - Always end library responses with the booking URL
 - Never invent room availability — only use [LIVE LIBRARY DATA]"""
@@ -166,37 +175,68 @@ LIBRARY RESPONSE RULES:
                     extra_context = f"\n\n[LIVE BUS DATA - {direction_label}]\n{format_etas_for_agent(etas)}"
             
             # Check if library-related
-            library_keywords = ["room", "study room", "pod", "nap", "library", "book", "lc-s", "available", "free room", "study space", "quiet", "space", "seat"]
+            library_keywords = ["room", "study room", "learning commons", "lc-", "lg1", "lg3", "lg4", "1f", "pod", "nap", "library", "book", "available", "free room", "study space", "quiet", "space", "seat", "study"]
             is_library_query = any(k in message_lower for k in library_keywords)
 
             if is_library_query:
                 now = datetime.now()
                 date_str = now.strftime("%Y-%m-%d")
                 current_hour = now.hour
-                current_minute = now.minute
+                current_minute = 0 if now.minute < 30 else 30
 
-                # Check if asking about a specific time
+                # Detect "free until X" or "from now to X" pattern
                 import re
-                time_match = re.search(r'\b(\d{1,2})(?::\d{2})?\s*(pm|am)?\b', message_lower)
-                if time_match:
-                    h = int(time_match.group(1))
-                    meridiem = time_match.group(2)
+                until_match = re.search(r'(?:until|till|to|until)\s*(\d{1,2})(?::00)?\s*(pm|am)?', message_lower)
+                from_match  = re.search(r'(?:from|at|@)\s*(\d{1,2})(?::00)?\s*(pm|am)?', message_lower)
+                time_match  = re.search(r'\b(\d{1,2})(?::00)?\s*(pm|am)\b', message_lower)
+
+                if until_match:
+                    # "rooms free from now to 7pm" — find continuously free rooms
+                    until_h = int(until_match.group(1))
+                    if until_match.group(2) == "pm" and until_h < 12:
+                        until_h += 12
+                    result = find_rooms_free_until(date_str, current_hour, current_minute, until_h)
+                    extra_context += f"\n\n[LIVE LIBRARY DATA - continuously free until {until_h:02d}:00]\n{format_continuous_for_agent(result)}"
+
+                elif from_match or time_match:
+                    # "rooms at 5pm" — show that specific slot + next 2
+                    match = from_match or time_match
+                    h = int(match.group(1))
+                    meridiem = match.group(2)
                     if meridiem == "pm" and h < 12:
                         h += 12
                     elif meridiem == "am" and h == 12:
                         h = 0
-                    # Show requested hour + next 2 hours
-                    slots = get_availability_for_range(date_str, h, 3)
-                    extra_context += f"\n\n[LIVE LIBRARY DATA]\n{format_range_for_agent(slots)}\nFor full room list at a specific hour, ask me."
+                    m = 0
+                    slots = get_slots_range(date_str, h, m, 4)
+                    extra_context += f"\n\n[LIVE LIBRARY DATA from {h:02d}:00]\n{format_range_for_agent(slots)}"
+                    # Also give full detail for the requested slot
+                    slot = get_slot_availability(date_str, h, m)
+                    extra_context += f"\nFull detail for {h:02d}:00:\n{format_slot_for_agent(slot)}"
+
+                elif any(k in message_lower for k in ["next few", "later", "upcoming", "next hour", "rest of", "today"]):
+                    # "what's available later" — show next 6 slots (3 hours)
+                    slots = get_slots_range(date_str, current_hour, current_minute, 6)
+                    extra_context += f"\n\n[LIVE LIBRARY DATA - next 3 hours]\n{format_range_for_agent(slots)}"
+
                 else:
-                    # Smart default: if >45 min into current hour, start from next hour
-                    start_hour = current_hour + 1 if current_minute >= 45 else current_hour
-                    slots = get_availability_for_range(date_str, start_hour, 4)
-                    slot_details = get_available_rooms(date_str, start_hour)
-                    extra_context += f"\n\n[LIVE LIBRARY DATA - current time is {current_hour:02d}:{current_minute:02d}]\n"
-                    extra_context += f"Next available slots:\n{format_range_for_agent(slots)}\n"
-                    extra_context += f"\nFull room list for {start_hour:02d}:00:\n{format_availability_for_agent(slot_details)}"
+                    # Default: show current slot + next 3 slots
+                    # Smart timing: if >40 min into current slot, lead with next slot
+                    lead_hour = current_hour
+                    lead_minute = current_minute
+                    if now.minute >= 40 and current_minute == 0:
+                        lead_minute = 30
+                    elif now.minute >= 10 and current_minute == 30:
+                        lead_hour = current_hour + 1
+                        lead_minute = 0
+
+                    slot = get_slot_availability(date_str, lead_hour, lead_minute)
+                    slots = get_slots_range(date_str, lead_hour, lead_minute, 4)
+                    extra_context += f"\n\n[LIVE LIBRARY DATA - current time {now.hour:02d}:{now.minute:02d}]\n"
+                    extra_context += f"Upcoming slots:\n{format_range_for_agent(slots)}\n"
+                    extra_context += f"Full detail for {lead_hour:02d}:{lead_minute:02d}:\n{format_slot_for_agent(slot)}"
                     
+                           
             # Build message with live data injected
             user_content = message
             if extra_context:

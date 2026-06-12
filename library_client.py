@@ -294,6 +294,290 @@ def print_full_day(date_str: str = None):
         print()
 
 # ============================================================
+# IN-SESSION BOOKINGS (memory only, resets on server restart)
+# ============================================================
+_session_bookings = {}  # key: "date_roomid_hour_minute" → booking info
+
+def book_room(date_str: str, room_id: str, hour: int, minute: int, num_slots: int, booked_by: str = "you") -> dict:
+    """
+    'Book' a room by marking slots as occupied in session memory.
+    Returns booking confirmation dict.
+    """
+    # Validate room exists
+    room_info = LC_ROOMS.get(room_id) or STUDY_ROOMS.get(room_id)
+    if not room_info:
+        return {"success": False, "error": f"Room {room_id} does not exist."}
+
+    # Validate slots are available
+    h, m = hour, minute
+    slots_to_book = []
+    for _ in range(num_slots):
+        if h >= LIBRARY_CLOSE:
+            return {"success": False, "error": "Booking extends beyond library closing time."}
+        slot = get_slot_availability(date_str, h, m)
+        if slot.get("closed"):
+            return {"success": False, "error": f"Library closed at {h:02d}:{m:02d}."}
+        # Check room is available (not in dummy data occupied AND not already session-booked)
+        key = f"{date_str}_{room_id}_{h}_{m}"
+        if key in _session_bookings:
+            return {"success": False, "error": f"{room_id} is already booked at {h:02d}:{m:02d}."}
+        room_type = "learning_commons" if room_id in LC_ROOMS else "study_rooms"
+        if room_id not in slot.get(room_type, {}):
+            return {"success": False, "error": f"{room_id} is not available at {h:02d}:{m:02d}."}
+        slots_to_book.append((h, m))
+        m += 30
+        if m >= 60:
+            m = 0
+            h += 1
+
+    # All slots available — mark as booked
+    for bh, bm in slots_to_book:
+        key = f"{date_str}_{room_id}_{bh}_{bm}"
+        _session_bookings[key] = {
+            "room_id": room_id,
+            "date": date_str,
+            "hour": bh,
+            "minute": bm,
+            "booked_by": booked_by,
+        }
+
+    end_h, end_m = slots_to_book[-1]
+    end_m += 30
+    if end_m >= 60:
+        end_m = 0
+        end_h += 1
+
+    return {
+        "success": True,
+        "room_id": room_id,
+        "floor": room_info["floor"],
+        "capacity": room_info["capacity"],
+        "room_type": room_info["type"],
+        "date": date_str,
+        "start": f"{slots_to_book[0][0]:02d}:{slots_to_book[0][1]:02d}",
+        "end": f"{end_h:02d}:{end_m:02d}",
+        "num_slots": num_slots,
+        "booking_ref": f"DEMO-{room_id}-{date_str}-{slots_to_book[0][0]:02d}{slots_to_book[0][1]:02d}",
+    }
+
+def is_room_session_booked(date_str: str, room_id: str, hour: int, minute: int) -> bool:
+    key = f"{date_str}_{room_id}_{hour}_{minute}"
+    return key in _session_bookings
+
+def find_best_room(date_str: str, hour: int, minute: int, num_slots: int, min_capacity: int) -> dict:
+    """
+    Find the best available room matching capacity requirement for all requested slots.
+    Returns the recommended room or alternatives if exact match not found.
+    """
+    # Get rooms free for ALL requested slots
+    h, m = hour, minute
+    free_sets = []
+    for _ in range(num_slots):
+        if h >= LIBRARY_CLOSE:
+            break
+        slot = get_slot_availability(date_str, h, m)
+        lc_free = set(slot.get("learning_commons", {}).keys())
+        sr_free = set(slot.get("study_rooms", {}).keys())
+        # Exclude session-booked rooms
+        lc_free = {r for r in lc_free if not is_room_session_booked(date_str, r, h, m)}
+        sr_free = {r for r in sr_free if not is_room_session_booked(date_str, r, h, m)}
+        free_sets.append(lc_free | sr_free)
+        m += 30
+        if m >= 60:
+            m = 0
+            h += 1
+
+    if not free_sets:
+        return {"found": False, "reason": "No slots available"}
+
+    # Rooms free in ALL slots
+    continuously_free = free_sets[0]
+    for s in free_sets[1:]:
+        continuously_free &= s
+
+    # Filter by capacity
+    matching = []
+    for room_id in continuously_free:
+        info = LC_ROOMS.get(room_id) or STUDY_ROOMS.get(room_id)
+        if info and info["capacity"] >= min_capacity:
+            matching.append((room_id, info))
+
+    if matching:
+        # Sort: prefer exact capacity match, then smallest that fits
+        matching.sort(key=lambda x: x[1]["capacity"])
+        best_room, best_info = matching[0]
+        return {
+            "found": True,
+            "room_id": best_room,
+            "capacity": best_info["capacity"],
+            "floor": best_info["floor"],
+            "room_type": best_info["type"],
+            "alternatives": [(r, i) for r, i in matching[1:4]],
+        }
+
+    # No exact match — find alternatives
+    # Try smaller capacity
+    smaller = []
+    for room_id in continuously_free:
+        info = LC_ROOMS.get(room_id) or STUDY_ROOMS.get(room_id)
+        if info:
+            smaller.append((room_id, info))
+    smaller.sort(key=lambda x: -x[1]["capacity"])  # largest first
+
+    # Try different time slots (±1 hour)
+    alt_times = []
+    for delta in [-2, -1, 1, 2, 3, 4]:
+        alt_h = hour + delta // 2
+        alt_m = minute + (delta % 2) * 30
+        if alt_m >= 60:
+            alt_m -= 60
+            alt_h += 1
+        if LIBRARY_OPEN <= alt_h < LIBRARY_CLOSE:
+            alt_result = find_best_room(date_str, alt_h, alt_m, num_slots, min_capacity)
+            if alt_result["found"]:
+                alt_times.append((f"{alt_h:02d}:{alt_m:02d}", alt_result["room_id"], alt_result["capacity"]))
+            if len(alt_times) >= 2:
+                break
+
+    return {
+        "found": False,
+        "reason": f"No rooms with capacity ≥{min_capacity} free for all {num_slots} slots",
+        "smaller_options": [(r, i) for r, i in smaller[:3]],
+        "alt_times": alt_times,
+    }
+
+def format_booking_confirmation(booking: dict) -> str:
+    if not booking["success"]:
+        return f"Booking failed: {booking['error']}"
+    return (
+        f"✅ Booked! {booking['room_id']} ({booking['room_type']}, {booking['floor']}, "
+        f"seats {booking['capacity']}) on {booking['date']} "
+        f"from {booking['start']} to {booking['end']}.\n"
+        f"Reference: {booking['booking_ref']}\n"
+        f"Note: This is a demo booking. For real bookings visit https://lbbooking.ust.hk"
+    )
+
+def format_room_recommendation(result: dict, date_str: str, start: str, end: str) -> str:
+    if not result["found"]:
+        lines = [f"No rooms with enough capacity free from {start} to {end}."]
+        if result.get("smaller_options"):
+            lines.append("Smaller rooms available:")
+            for r, info in result["smaller_options"]:
+                lines.append(f"  • {r} ({info['type']}, {info['floor']}, seats {info['capacity']})")
+        if result.get("alt_times"):
+            lines.append("Same capacity available at:")
+            for t, r, cap in result["alt_times"]:
+                lines.append(f"  • {t} — {r} (seats {cap})")
+        return "\n".join(lines)
+
+    alts = ""
+    if result.get("alternatives"):
+        alt_strs = [f"{r} (seats {i['capacity']})" for r, i in result["alternatives"]]
+        alts = f"\nAlternatives: {', '.join(alt_strs)}"
+
+    return (
+        f"Best match: {result['room_id']} ({result['room_type']}, "
+        f"{result['floor']}, seats {result['capacity']}) "
+        f"from {start} to {end} on {date_str}.{alts}"
+    )
+
+def print_full_day_text(date_str: str = None) -> str:
+    """Returns full day availability as Markdown tables — one per floor"""
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+
+    all_slots = []
+    for h in range(LIBRARY_OPEN, LIBRARY_CLOSE):
+        all_slots.append((h, 0))
+        all_slots.append((h, 30))
+
+    # Group study rooms by floor
+    rooms_by_floor = {
+        "1/F": [],
+        "LG1": [],
+        "LG3": [],
+        "LG4": [],
+    }
+    
+    for room_id, info in STUDY_ROOMS.items():
+        floor = info["floor"]
+        if floor in rooms_by_floor:
+            rooms_by_floor[floor].append(room_id)
+    
+    # Sort rooms within each floor
+    for floor in rooms_by_floor:
+        rooms_by_floor[floor].sort()
+    
+    lines = [f"## Full Day Availability — {date_str}", ""]
+    
+    # === Learning Commons Table (LC-1 to LC-18) ===
+    lc_rooms = list(LC_ROOMS.keys())
+    lines.append("### Learning Commons (LG1)")
+    lines.append("")
+    
+    header = "| Time | " + " | ".join(lc_rooms) + " |"
+    separator = "|------|" + "|".join(["------" for _ in lc_rooms]) + "|"
+    lines.append(header)
+    lines.append(separator)
+    
+    for h, m in all_slots:
+        slot = get_slot_availability(date_str, h, m)
+        row_icons = []
+        for room_id in lc_rooms:
+            if slot.get("closed"):
+                row_icons.append("❌")
+            elif room_id in slot.get("learning_commons", {}):
+                row_icons.append("✅")
+            else:
+                row_icons.append("❌")
+        time_str = f"{h:02d}:{m:02d}"
+        lines.append(f"| {time_str} | " + " | ".join(row_icons) + " |")
+    
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    
+    # === Study Rooms by Floor ===
+    for floor, room_ids in rooms_by_floor.items():
+        if not room_ids:
+            continue
+            
+        lines.append(f"### Study Rooms — {floor}")
+        lines.append("")
+        
+        # Header
+        header = "| Time | " + " | ".join(room_ids) + " |"
+        separator = "|------|" + "|".join(["------" for _ in room_ids]) + "|"
+        lines.append(header)
+        lines.append(separator)
+        
+        for h, m in all_slots:
+            slot = get_slot_availability(date_str, h, m)
+            row_icons = []
+            for room_id in room_ids:
+                if slot.get("closed"):
+                    row_icons.append("❌")
+                elif room_id in slot.get("study_rooms", {}):
+                    row_icons.append("✅")
+                else:
+                    row_icons.append("❌")
+            time_str = f"{h:02d}:{m:02d}"
+            lines.append(f"| {time_str} | " + " | ".join(row_icons) + " |")
+        
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    
+    # Legend
+    lines.append("### Legend")
+    lines.append("- ✅ = Available (free to book)")
+    lines.append("- ❌ = Booked/Occupied")
+    lines.append(f"- Hours: {LIBRARY_OPEN}:00 – {LIBRARY_CLOSE}:00")
+    lines.append("- Book at: https://lbbooking.ust.hk")
+    
+    return "\n".join(lines)
+
+# ============================================================
 # TEST
 # ============================================================
 if __name__ == "__main__":

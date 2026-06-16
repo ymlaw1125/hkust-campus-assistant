@@ -31,14 +31,28 @@ from library_client import (
     LC_ROOMS,
     STUDY_ROOMS,
 )
+from sports_client import (
+    resolve_sport,
+    match_venue_hint,
+    find_available_venue,
+    free_courts,
+    book_facility,
+    format_venue_recommendation,
+    format_sports_confirmation,
+    list_venues_for_sport,
+    print_sports_day_text,
+    SPORT_INFO,
+    SPORT_LABELS,
+    SPORT_VENUES,
+    FACILITIES,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-_INTERNAL_TAGS = re.compile(
-    r'\[(?:LIVE BUS DATA|LIVE LIBRARY DATA|BOOKING RECOMMENDATION|BOOKING SEARCH RESULT|'
-    r'BOOKING DURATION NEEDED|PLANNING MODE|PLANNING DATA|SPLIT BOOKING SOLUTION)[^\]]*\]'
-)
+# Strip ANY internal control tag like [BOOKING CONFIRMED], [NOTE], [SLOT LIMIT REACHED]
+# that the LLM might echo. Matches an opening UPPERCASE bracketed tag generically.
+_INTERNAL_TAGS = re.compile(r'\[[A-Z][A-Z0-9 /_-]{1,40}\]')
 
 
 def _parse_hour(h: int, meridiem: Optional[str], fallback_pm_if_low: bool = True) -> int:
@@ -228,9 +242,69 @@ def _parse_floor_pref(low: str) -> Optional[str]:
     return None
 
 
+# ── HK origins → how to reach HKUST ──────────────────────────────────────────
+# Only 5 bus routes serve HKUST, each from a fixed interchange. For origins AT an
+# interchange ("near"), you board the bus directly and the live ETA is meaningful.
+# For everywhere else you MTR to the interchange ("via") first, so we DON'T show a
+# precise next-bus time (you're not there yet) — we route honestly, no made-up ETA.
+# travel_min is a rough door-to-door estimate to campus; gate is where you alight.
+HK_ORIGINS = {
+    # On/near an HKUST interchange — board the bus directly, live ETA applies
+    "hang hau":       {"route": "11M",  "gate": "North Gate", "travel_min": 22, "near": True},
+    "po lam":         {"route": "91M",  "gate": "North Gate", "travel_min": 28, "near": True},
+    "diamond hill":   {"route": "91M",  "gate": "South Gate", "travel_min": 35, "near": True},
+    "choi hung":      {"route": "91M",  "gate": "South Gate", "travel_min": 32, "near": True},
+    "tseung kwan o":  {"route": "792M", "gate": "North Gate", "travel_min": 28, "near": True},
+    "tko":            {"route": "792M", "gate": "North Gate", "travel_min": 28, "near": True},
+    "tiu keng leng":  {"route": "792M", "gate": "North Gate", "travel_min": 30, "near": True},
+    "sai kung":       {"route": "12",   "gate": "North Gate", "travel_min": 35, "near": True},
+    # East Kowloon → MTR to Choi Hung / Diamond Hill, then 91M
+    "san po kong":    {"route": "91M",  "via": "Choi Hung",   "gate": "South Gate", "travel_min": 42},
+    "wong tai sin":   {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 44},
+    "ngau chi wan":   {"route": "91M",  "via": "Choi Hung",   "gate": "South Gate", "travel_min": 38},
+    "kowloon bay":    {"route": "91M",  "via": "Choi Hung",   "gate": "South Gate", "travel_min": 38},
+    "ngau tau kok":   {"route": "91M",  "via": "Choi Hung",   "gate": "South Gate", "travel_min": 40},
+    "kwun tong":      {"route": "91M",  "via": "Choi Hung",   "gate": "South Gate", "travel_min": 44},
+    "lam tin":        {"route": "792M", "via": "Tseung Kwan O","gate": "North Gate","travel_min": 40},
+    "yau tong":       {"route": "792M", "via": "Tseung Kwan O","gate": "North Gate","travel_min": 38},
+    "kowloon tong":   {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 46},
+    "lok fu":         {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 46},
+    # Central / West Kowloon → MTR to Diamond Hill, then 91M
+    "mong kok":       {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 52},
+    "prince edward":  {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 53},
+    "yau ma tei":     {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 54},
+    "jordan":         {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 55},
+    "tsim sha tsui":  {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 56},
+    "tst":            {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 56},
+    "sham shui po":   {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 54},
+    "hung hom":       {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 50},
+    # HK Island East → on/near the TKO line, so MTR to Hang Hau, then 11M
+    "north point":    {"route": "11M",  "via": "Hang Hau",    "gate": "North Gate", "travel_min": 50},
+    "quarry bay":     {"route": "11M",  "via": "Hang Hau",    "gate": "North Gate", "travel_min": 48},
+    "tai koo":        {"route": "11M",  "via": "Hang Hau",    "gate": "North Gate", "travel_min": 48},
+    # HK Island Central/West → MTR east to the TKO line at North Point, then 11M
+    "central":        {"route": "11M",  "via": "Hang Hau",    "gate": "North Gate", "travel_min": 58},
+    "admiralty":      {"route": "11M",  "via": "Hang Hau",    "gate": "North Gate", "travel_min": 56},
+    "wan chai":       {"route": "11M",  "via": "Hang Hau",    "gate": "North Gate", "travel_min": 55},
+    "causeway bay":   {"route": "11M",  "via": "Hang Hau",    "gate": "North Gate", "travel_min": 54},
+    # New Territories → MTR to Diamond Hill, then 91M
+    "sha tin":        {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 55},
+    "tai wai":        {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 52},
+    "tai po":         {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 65},
+    "tsuen wan":      {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 70},
+    "airport":        {"route": "91M",  "via": "Diamond Hill","gate": "South Gate", "travel_min": 85},
+}
+
+ARRIVAL_PHRASES = [
+    "when i arrive", "when i get there", "when i get to", "when i reach",
+    "on arrival", "by the time i arrive", "once i arrive", "after i arrive",
+    "when im there", "when i'm there", "when i get in",
+]
+
+
 class AgentFrameworkAgent(AgentInterface):
 
-    AGENT_PROMPT = """You are a helpful HKUST campus assistant for bus transport and library room bookings.
+    AGENT_PROMPT = """You are a helpful HKUST campus assistant for bus transport, library room bookings, and sports facility bookings.
 
 BUS STOP LOCATIONS AT HKUST:
 - NORTH GATE: 91M (towards Po Lam / Hang Hau), 11, 11M, 12, 792M
@@ -268,6 +342,13 @@ LIBRARY (lbbooking.ust.hk):
 - Study Rooms: 1/F (1F-R1–4), LG1 (LG1-R1–9), LG3 (LG3-R1–9), LG4 (LG4-R1–11). All seat ~4.
 - Hours: 8am–11pm.
 
+SPORTS FACILITIES (fbs.hkust.edu.hk):
+- 1-hour slots, 1 slot per facility per day, booking opens 8am 7 days ahead.
+- Bookable: badminton, squash, table tennis, tennis, basketball, football, volleyball, handball, netball, pickleball, climbing, gym, dance, fencing, martial arts, archery.
+- Walk-in (no booking): running (400m track), swimming (pool).
+- Contact only: water sports (dragon boat, rowing, windsurfing, kayaking, sailing).
+- The system handles all sports availability and booking — never invent venues or court availability.
+
 BOOKING FLOW:
 - [BOOKING RECOMMENDATION]: Present the room name, floor, seats, date, and time range. Ask "Shall I book this for you?" — one short question only.
 - [BOOKING CONFIRMED]: Booking succeeded. Show the reference number and say it's confirmed.
@@ -304,6 +385,9 @@ RESPONSE RULES:
         self._edit_after_cancel: bool = False
         self._rejected_booking_ctx: Optional[dict] = None
         self._pending_edit: Optional[dict] = None
+        self.pending_sports: Optional[dict] = None
+        self._waiting_sports_time: Optional[dict] = None
+        self._plan_ctx: Optional[dict] = None
         self._create_client()
 
     def _create_client(self):
@@ -368,6 +452,16 @@ RESPONSE RULES:
                     num_slots=12,  # 6 hours
                 )
 
+            if message.strip() == "$SPORTS" or message.strip().startswith("$SPORTS "):
+                parts = message.strip().split(None, 1)
+                sport = resolve_sport(parts[1]) if len(parts) > 1 else None
+                return print_sports_day_text(
+                    now.strftime("%Y-%m-%d"),
+                    sport_filter=sport,
+                    from_hour=now.hour,
+                    num_slots=8,
+                )
+
             confirm_words = {"yes", "yeah", "yep", "ok", "okay", "sure", "go ahead",
                              "confirm", "book it", "do it", "please", "yup", "correct"}
             cancel_words  = {"no", "nope", "cancel", "don't", "dont", "nevermind",
@@ -376,15 +470,52 @@ RESPONSE RULES:
 
             # ── Edit-confirm flow (change an existing booking) ────────────
             if self._pending_edit:
-                if any(w in low for w in confirm_words):
+                if self._matches(low, confirm_words):
                     return self._apply_edit()
-                elif any(w in low for w in cancel_words):
+                elif self._matches(low, cancel_words):
                     self._pending_edit = None
                     return "No change made. Your original booking is still active."
 
+            # ── Sports booking confirm flow ───────────────────────────────
+            if self.pending_sports:
+                ps = self.pending_sports
+                # User naming a different venue ("I said the multi-purpose room") →
+                # switch to it at the same time instead of treating it as confirm/cancel.
+                hint = match_venue_hint(ps["sport"], low)
+                if hint and hint != ps["facility"]:
+                    repick = self._repick_sport_venue(ps, hint)
+                    if repick:
+                        return repick
+                if self._matches(low, confirm_words):
+                    self.pending_sports = None
+                    booking = book_facility(ps["date"], ps["facility"], ps["hour"], ps["sport"])
+                    if booking["success"]:
+                        self.my_bookings.append({
+                            "ref": booking["booking_ref"],
+                            "room_id": booking["name"],
+                            "fac_id": ps["facility"],
+                            "date": booking["date"],
+                            "start": booking["start"],
+                            "end": booking["end"],
+                            "num_slots": 1,
+                            "kind": "sports",
+                        })
+                    return format_sports_confirmation(booking)
+                elif self._matches(low, cancel_words):
+                    self.pending_sports = None
+                    return "No problem — I haven't booked anything. Want a different time or sport?"
+
+            # ── Sports time follow-up ─────────────────────────────────────
+            if self._waiting_sports_time and not self.pending_sports:
+                t = _parse_time_str(low)
+                if t:
+                    ctx = self._waiting_sports_time
+                    self._waiting_sports_time = None
+                    return self._do_sports_search(ctx["sport"], ctx["date"], t[0], t[1])
+
             # ── Cancel-confirm flow ───────────────────────────────────────
             if self._pending_cancel_ref:
-                if any(w in low for w in confirm_words):
+                if self._matches(low, confirm_words):
                     from db import cancel_booking as db_cancel
                     ref = self._pending_cancel_ref
                     self._pending_cancel_ref = None
@@ -394,7 +525,7 @@ RESPONSE RULES:
                         return f"✅ Cancelled. Booking {ref} has been removed."
                     else:
                         return f"Couldn't find booking {ref} in the system — it may have already been cancelled."
-                elif any(w in low for w in cancel_words):
+                elif self._matches(low, cancel_words):
                     self._pending_cancel_ref = None
                     return "Cancellation aborted. Your booking is still active."
 
@@ -421,7 +552,7 @@ RESPONSE RULES:
 
             # ── Booking confirmation ───────────────────────────────────────
             if self.pending_booking:
-                if any(w in low for w in confirm_words):
+                if self._matches(low, confirm_words):
                     pb = self.pending_booking
                     self.pending_booking = None
                     booking = book_room(
@@ -441,7 +572,7 @@ RESPONSE RULES:
                             "num_slots": pb["num_slots"],
                         })
                     return format_booking_confirmation(booking)
-                elif any(w in low for w in cancel_words):
+                elif self._matches(low, cancel_words):
                     # Save time window so we can reuse it if user asks for a different room
                     self._rejected_booking_ctx = {
                         "date":      self.pending_booking["date"],
@@ -469,6 +600,7 @@ RESPONSE RULES:
 
             self._waiting_duration = False
             self._duration_context = None
+            self._waiting_sports_time = None
 
             # ── Cancel / edit / view-bookings intent ──────────────────────
             edit_verbs   = ["change", "edit", "reschedule", "move", "switch", "swap", "rebook"]
@@ -503,40 +635,61 @@ RESPONSE RULES:
                         lines.append(f"• {b['room_id']} {b['start']}–{b['end']}  (ref: {b['ref']})")
                     return "\n".join(lines)
 
-            # ── Combined planning: "I'm at X, want to study/book at HKUST" ──
-            ORIGIN_INFO = {
-                "hang hau":    {"route": "11M", "travel_min": 15},
-                "po lam":      {"route": "91M", "travel_min": 25},
-                "diamond hill":{"route": "91M", "travel_min": 38},
-                "choi hung":   {"route": "91M", "travel_min": 32},
-                "tko":         {"route": "792M","travel_min": 22},
-                "tseung kwan o":{"route":"792M","travel_min": 22},
-                "sai kung":    {"route": "12",  "travel_min": 30},
-            }
+            # ── Combined planning: "I'm at X, want to study/play/book at HKUST" ──
             planning_triggers = [
                 "im at", "i'm at", "i am at", "coming from", "leaving from",
                 "on my way", "heading to", "going to school", "going to campus",
+                "going to hkust", "going to ust", "going to uni", "to school",
                 "when i get", "by the time i get", "arrive at school",
             ]
-            detected_origin = next(
-                (loc for loc in ORIGIN_INFO if loc in low), None
-            )
-            is_planning = (
-                detected_origin is not None
-                and (
-                    any(t in low for t in planning_triggers)
-                    or any(k in low for k in ["study", "book", "room", "library"])
-                )
+            arrival_phrase = any(p in low for p in ARRIVAL_PHRASES)
+            sport_for_plan = resolve_sport(low)
+            detected_origin = next((loc for loc in HK_ORIGINS if loc in low), None)
+
+            # "book one when I arrive" — reuse the origin from an earlier planning turn
+            if detected_origin is None and self._plan_ctx and arrival_phrase:
+                detected_origin = self._plan_ctx.get("origin")
+
+            is_planning = detected_origin is not None and (
+                any(t in low for t in planning_triggers)
+                or arrival_phrase
+                or sport_for_plan is not None
+                or any(k in low for k in ["study", "book", "room", "library", "play"])
             )
 
             if is_planning:
-                plan_reply = await self._handle_planning(low, now, detected_origin, ORIGIN_INFO)
-                # Store in history so follow-up context is maintained
+                sport = sport_for_plan
+                # Inherit the remembered sport only if they aren't asking for a room/library
+                if sport is None and not any(k in low for k in
+                                             ["room", "study", "library", "desk"]):
+                    sport = (self._plan_ctx or {}).get("sport")
+                plan_reply = await self._handle_planning(low, now, detected_origin, sport, arrival_phrase)
                 self.conversation_history.append({"role": "user", "content": message})
                 self.conversation_history.append({"role": "assistant", "content": plan_reply[:300]})
                 if len(self.conversation_history) > 8:
                     self.conversation_history = self.conversation_history[-8:]
                 return plan_reply
+
+            # ── Chained booking: "after I finish badminton, study at lg3" ──
+            chain_phrases = ["after i finish", "after im done", "after i'm done",
+                             "after that", "when im done", "when i'm done",
+                             "once i finish", "once im done", "after my",
+                             "after playing", "after the game", "after i play",
+                             "then study", "after badminton", "after my game"]
+            wants_study = ("study" in low or "library" in low
+                           or _parse_floor_pref(low) in ("LG1", "LG3", "LG4", "1/F", "LC"))
+            if (any(p in low for p in chain_phrases) and wants_study
+                    and any(b["date"] == now.strftime("%Y-%m-%d") for b in self.my_bookings)):
+                chained = self._handle_chained_study(low, now)
+                if chained:
+                    return chained
+
+            # ── Sports facilities ─────────────────────────────────────────
+            # A "study" request that merely mentions a sport (e.g. "after badminton,
+            # study at lg3") is a LIBRARY booking — don't let the sport word grab it.
+            sport = resolve_sport(low)
+            if sport and "study" not in low and "library" not in low:
+                return await self._handle_sports(message, low, now, sport)
 
             # ── Detect intent ─────────────────────────────────────────────
             booking_kws = {"book", "reserve", "booking", "reservation", "need a room",
@@ -678,6 +831,10 @@ RESPONSE RULES:
                  "| Room | Start | End | Reference |",
                  "|------|-------|-----|-----------|"]
         for b in self.my_bookings:
+            if b.get("kind") == "sports":
+                # 1-hour slot, stored start/end directly
+                lines.append(f"| {b['room_id']} | {b['start']} | {b['end']} | {b['ref']} |")
+                continue
             h, m = int(b["start"][:2]), int(b["start"][3:])
             for _ in range(b["num_slots"]):
                 end_m, end_h = m + 30, h
@@ -707,6 +864,11 @@ RESPONSE RULES:
             if b["room_id"].lower() in low:
                 target = b
                 break
+
+        # Sports bookings aren't editable in place — cancel and rebook instead
+        if target.get("kind") == "sports":
+            return (f"To change your {target['room_id']} booking ({target['start']}–{target['end']}), "
+                    f"cancel it first then book a new slot — sports slots can't be moved in place.")
 
         old_h, old_m = int(target["start"][:2]), int(target["start"][3:])
         old_slots = target["num_slots"]
@@ -803,6 +965,21 @@ RESPONSE RULES:
             or re.search(r'(?:from|at|until|till)\s+\d', low)
         )
 
+    @staticmethod
+    def _matches(low: str, words: set) -> bool:
+        """
+        Word-aware membership test. Single-word entries must match a whole token
+        (so "no" no longer matches "north"); multi-word entries match as substrings.
+        """
+        tokens = set(re.findall(r"[a-z0-9']+", low))
+        for w in words:
+            if " " in w:
+                if w in low:
+                    return True
+            elif w in tokens:
+                return True
+        return False
+
     def _reprice_room(self, pb: dict, preferred_floor: Optional[str],
                       excluded_floor: Optional[str]) -> Optional[str]:
         """
@@ -838,42 +1015,115 @@ RESPONSE RULES:
             f"Shall I book {room_id}?"
         )
 
-    async def _handle_planning(self, low: str, now: datetime, origin: str, origin_info: dict) -> str:
+    async def _handle_planning(self, low: str, now: datetime, origin: str,
+                               sport: Optional[str] = None,
+                               arrival_phrase: bool = False) -> str:
         """
-        Combined bus + library planning. Returns a direct reply string (no LLM).
-        1. Fetch live bus ETAs for routes going to HKUST.
-        2. Compute estimated library arrival = now + bus_wait + travel + 10 min walk.
-        3. Find an available room and set pending_booking.
+        Combined bus + (sports OR library) planning. Returns a direct reply (no LLM).
+        1. Estimate arrival at HKUST from the origin (door-to-door + live next-bus).
+        2. If a sport is in play → recommend & hold a sports court at arrival.
+           Otherwise → recommend & hold a library room at arrival.
+        Remembers the origin/sport in _plan_ctx so "book one when I arrive" works.
         """
-        info = origin_info[origin]
+        info = HK_ORIGINS[origin]
         route = info["route"]
         travel_min = info["travel_min"]
-        WALK_MIN = 10  # bus stop → library
+        gate = info.get("gate", "")
+        via = info.get("via")  # interchange to transfer at (None = you're already there)
 
-        etas = await get_all_hkust_etas("hkust")
+        date_str = now.strftime("%Y-%m-%d")
+        if any(w in low for w in ["tomorrow", "tmr", "tmrw"]):
+            date_str = (now + dt.timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # Find best ETA for preferred route, fallback to any route
-        wait_min, actual_route = None, route
-        for entry in etas:
-            if entry.get("label") == route and entry.get("etas"):
-                wait_min = entry["etas"][0]["minutes"]
-                break
-        if wait_min is None:
-            for entry in etas:
-                if entry.get("etas"):
-                    actual_route = entry["label"]
-                    wait_min = entry["etas"][0]["minutes"]
-                    break
+        # Live next-bus ONLY makes sense if you're at the interchange (near origin).
+        # For far origins we don't invent a precise ETA — you haven't reached the stop.
+        wait_min = None
+        if via is None:
+            try:
+                etas = await get_all_hkust_etas("all")
+                for entry in etas:
+                    if entry.get("label") == route and entry.get("etas"):
+                        wait_min = entry["etas"][0]["minutes"]
+                        break
+            except Exception:
+                wait_min = None
 
-        if wait_min is None:
-            return "Sorry, I can't fetch live bus ETAs right now. Please try again in a moment."
+        arrival = now + dt.timedelta(minutes=travel_min)
 
-        depart_time = now + dt.timedelta(minutes=wait_min)
-        arrival = now + dt.timedelta(minutes=wait_min + travel_min + WALK_MIN)
-        # Round UP to the next bookable 30-min slot (you can't book a slot before you arrive)
-        arr_h, arr_m = _round_up_slot(arrival.hour, arrival.minute)
+        # Remember context for follow-ups like "book one when I arrive"
+        self._plan_ctx = {"origin": origin, "sport": sport, "date": date_str}
+        # Planning takes over — clear any half-started library/sports prompts
+        self._waiting_duration = False
+        self._duration_context = None
+        self._waiting_sports_time = None
 
-        # Duration
+        if via:
+            route_text = f"MTR to **{via}**, then **{route}** to HKUST {gate}"
+            eta_str = ""  # no live ETA for a stop you haven't reached yet
+        else:
+            route_text = f"take **{route}** to HKUST {gate}"
+            eta_str = f" Next **{route}** in ~{wait_min} min." if wait_min is not None else ""
+        bus_line = (
+            f"🚌 From **{origin.title()}**: {route_text} "
+            f"(~{travel_min} min door-to-door).{eta_str}"
+        )
+
+        # If the user gave an explicit clock time (and isn't saying "when I arrive"),
+        # honour that instead of the computed arrival.
+        explicit = _parse_time_str(low) if (self._message_has_time(low) and not arrival_phrase) else None
+
+        # ── SPORTS planning ───────────────────────────────────────────────
+        if sport:
+            label = SPORT_LABELS.get(sport, sport.title())
+
+            if sport in SPORT_INFO:
+                fac = FACILITIES[SPORT_INFO[sport]]
+                return (f"{bus_line} ETA campus ~{arrival.hour:02d}:{arrival.minute:02d}.\n\n"
+                        f"🏃 **{label}** is at **{fac['name']}** ({fac['location']}) — "
+                        f"{fac['note']}. No booking needed, just turn up when you arrive.")
+
+            if explicit:
+                sp_h = explicit[0] + (1 if explicit[1] >= 30 else 0)
+            else:
+                # Round arrival UP to the next bookable 1-hour slot
+                sp_h = arrival.hour + (1 if arrival.minute > 0 else 0)
+
+            booked = {b.get("fac_id") for b in self.my_bookings
+                      if b.get("kind") == "sports" and b["date"] == date_str}
+            pref_fac = match_venue_hint(sport, low)
+            result = find_available_venue(date_str, sport, sp_h,
+                                          exclude=booked, preferred_facility=pref_fac)
+
+            arr_note = (f" ETA campus ~{arrival.hour:02d}:{arrival.minute:02d}"
+                        f" → first slot {sp_h:02d}:00." if not explicit else "")
+            if result["status"] == "ok":
+                self.pending_sports = {
+                    "sport": sport, "facility": result["facility"],
+                    "date": date_str, "hour": result["hour"],
+                }
+                rec = format_venue_recommendation(result, date_str, sport)
+                return f"{bus_line}{arr_note}\n\n{rec}\n\nShall I book it?"
+            if result["status"] == "full" and result.get("alt_times"):
+                alt = result["alt_times"][0]
+                fac = FACILITIES[alt["facility"]]
+                self.pending_sports = {
+                    "sport": sport, "facility": alt["facility"],
+                    "date": date_str, "hour": alt["hour"],
+                }
+                return (f"{bus_line}{arr_note}\n\n"
+                        f"{label} is full at {sp_h:02d}:00, but **{alt['hour']:02d}:00–"
+                        f"{alt['hour'] + 1:02d}:00** is free at **{fac['name']}**. "
+                        f"Shall I book that?")
+            self.pending_sports = None
+            return (f"{bus_line}{arr_note}\n\n"
+                    f"{format_venue_recommendation(result, date_str, sport)}")
+
+        # ── LIBRARY planning (default) ────────────────────────────────────
+        if explicit:
+            arr_h, arr_m = _round_up_slot(explicit[0], explicit[1])
+        else:
+            arr_h, arr_m = _round_up_slot(arrival.hour, arrival.minute)
+
         dur_h = re.search(r'(\d+)\s*hour', low)
         dur_m_match = re.search(r'(\d+)\s*(?:min|mins|minutes)', low)
         if dur_h:
@@ -885,16 +1135,12 @@ RESPONSE RULES:
 
         end_h = arr_h + (arr_m + num_slots * 30) // 60
         end_m = (arr_m + num_slots * 30) % 60
-        date_str = now.strftime("%Y-%m-%d")
 
         preferred_floor = _parse_floor_pref(low)
         result = find_best_room(date_str, arr_h, arr_m, num_slots, 1, preferred_floor)
 
-        bus_line = (
-            f"🚌 **{actual_route}** from {origin.title()} — next bus in **{wait_min} min** "
-            f"(depart ~{depart_time.hour:02d}:{depart_time.minute:02d}). "
-            f"~{travel_min} min ride + {WALK_MIN} min walk → arrive library ~{arr_h:02d}:{arr_m:02d}."
-        )
+        arr_note = (f" ETA campus ~{arrival.hour:02d}:{arrival.minute:02d}"
+                    f" → first slot {arr_h:02d}:{arr_m:02d}." if not explicit else "")
 
         if result["found"]:
             room_id = result["room_id"]
@@ -908,10 +1154,10 @@ RESPONSE RULES:
                 "capacity": result["capacity"],
             }
             return (
-                f"{bus_line}\n\n"
+                f"{bus_line}{arr_note}\n\n"
                 f"📚 **{room_id}** ({room_info['type']}, {room_info['floor']}, "
                 f"seats {room_info['capacity']}) is free {arr_h:02d}:{arr_m:02d}–{end_h:02d}:{end_m:02d}.\n\n"
-                f"Shall I book {room_id} for {arr_h:02d}:{arr_m:02d}–{end_h:02d}:{end_m:02d}?"
+                f"Shall I book {room_id}?"
             )
         else:
             alt_str = ""
@@ -919,10 +1165,186 @@ RESPONSE RULES:
                 alts = [f"{t} ({r})" for t, r, _ in result["alt_times"][:2]]
                 alt_str = f"\nAlternative slots: {', '.join(alts)}."
             return (
-                f"{bus_line}\n\n"
+                f"{bus_line}{arr_note}\n\n"
                 f"No rooms available at {arr_h:02d}:{arr_m:02d} for {num_slots*30} min.{alt_str}\n"
                 f"Would you like to try a different time?"
             )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # SPORTS
+    # ──────────────────────────────────────────────────────────────────────
+    async def _handle_sports(self, message: str, low: str, now: datetime, sport: str) -> str:
+        """Route a sports request: list venues, give walk-in info, or recommend a slot."""
+        date_str = now.strftime("%Y-%m-%d")
+        if any(w in low for w in ["tomorrow", "tmr", "tmrw"]):
+            date_str = (now + dt.timedelta(days=1)).strftime("%Y-%m-%d")
+        label = SPORT_LABELS.get(sport, sport.title())
+
+        # "where can I play X" / "which courts" → just list venues
+        if any(w in low for w in ["where can", "which venue", "what venue", "which court",
+                                  "where do", "list venue", "venues for", "facilities for",
+                                  "where is", "where are"]):
+            return list_venues_for_sport(sport)
+
+        # Walk-in / contact-only activities — no booking, just info
+        if sport in SPORT_INFO:
+            res = find_available_venue(date_str, sport, 12)
+            return format_venue_recommendation(res, date_str, sport)
+
+        # Need an explicit time for a 1-hour slot
+        if not self._message_has_time(low) and "now" not in low:
+            self._waiting_sports_time = {"sport": sport, "date": date_str}
+            return f"What time would you like to play {label}? Courts run in 1-hour slots."
+
+        t = _parse_time_str(low)
+        if not t:
+            self._waiting_sports_time = {"sport": sport, "date": date_str}
+            return f"What time would you like to play {label}? Courts run in 1-hour slots."
+
+        return self._do_sports_search(sport, date_str, t[0], t[1], match_venue_hint(sport, low))
+
+    def _repick_sport_venue(self, ps: dict, hint: str) -> Optional[str]:
+        """Switch a pending sports booking to a specific venue the user named, same time."""
+        courts = next((v["courts"] for v in SPORT_VENUES.get(ps["sport"], [])
+                       if v["id"] == hint), None)
+        if courts is None:
+            return None
+        fac = FACILITIES[hint]
+        h = ps["hour"]
+        fc = free_courts(ps["date"], hint, ps["sport"], courts, h)
+        if fc <= 0:
+            cur = FACILITIES[ps["facility"]]["name"]
+            return (f"{fac['name']} has no free courts at {h:02d}:00. "
+                    f"I've still got {cur} held for you — book that, or try another time?")
+        self.pending_sports = {**ps, "facility": hint}
+        note = f" · {fac['note']}" if fac["note"] else ""
+        return (f"Got it — **{fac['name']}** ({fac['location']}){note}: "
+                f"{fc} free at {h:02d}:00–{h + 1:02d}:00. Shall I book it?")
+
+    def _do_sports_search(self, sport: str, date_str: str, hour: int, minute: int,
+                          preferred_facility: Optional[str] = None) -> str:
+        """Find a venue for a sport at a time, set pending_sports if bookable."""
+        if minute >= 30:
+            hour += 1  # 1-hour slots — round up to the next hour
+        label = SPORT_LABELS.get(sport, sport.title())
+
+        # 1 slot per facility per day — exclude facilities the user already booked today
+        booked = {b.get("fac_id") for b in self.my_bookings
+                  if b.get("kind") == "sports" and b["date"] == date_str}
+        all_venue_ids = {v["id"] for v in SPORT_VENUES.get(sport, [])}
+        if all_venue_ids and all_venue_ids <= booked:
+            self.pending_sports = None
+            return (f"You've already used today's booking for every {label} venue "
+                    f"(1 slot per facility per day). Try another day or sport.")
+
+        result = find_available_venue(date_str, sport, hour, exclude=booked,
+                                      preferred_facility=preferred_facility)
+        if result["status"] == "ok":
+            self.pending_sports = {
+                "sport": sport,
+                "facility": result["facility"],
+                "date": date_str,
+                "hour": result["hour"],
+            }
+            rec = format_venue_recommendation(result, date_str, sport)
+            return f"{rec}\n\nShall I book it?"
+
+        # Requested time is full — offer the nearest free slot AS A PENDING booking,
+        # so a plain "yes" books it (instead of falling through to the LLM).
+        if result["status"] == "full" and result.get("alt_times"):
+            alt = result["alt_times"][0]
+            fac = FACILITIES[alt["facility"]]
+            self.pending_sports = {
+                "sport": sport,
+                "facility": alt["facility"],
+                "date": date_str,
+                "hour": alt["hour"],
+            }
+            others = result["alt_times"][1:3]
+            other_str = ""
+            if others:
+                other_str = (" Other options: "
+                             + ", ".join(f"{a['hour']:02d}:00" for a in others) + ".")
+            return (
+                f"{label} is fully booked at {hour:02d}:00. The nearest free slot is "
+                f"**{alt['hour']:02d}:00–{alt['hour'] + 1:02d}:00** at **{fac['name']}** "
+                f"({fac['location']}).{other_str}\n\nShall I book that instead?"
+            )
+
+        self.pending_sports = None
+        return format_venue_recommendation(result, date_str, sport)
+
+    def _handle_chained_study(self, low: str, now: datetime) -> Optional[str]:
+        """
+        "After I finish badminton, study at lg3 for 2 hours" → book a study room
+        starting when an existing booking (the anchor) ends. Deterministic, no LLM.
+        Returns a reply, or None to fall through if there's nothing to chain from.
+        """
+        date_str = now.strftime("%Y-%m-%d")
+        today = [b for b in self.my_bookings if b["date"] == date_str]
+        if not today:
+            return None
+
+        # Anchor = the booking we chain after. Prefer a sports booking if a sport is
+        # named (e.g. "after badminton"), else the latest-ending booking today.
+        sport = resolve_sport(low)
+        anchor = None
+        if sport:
+            anchor = next((b for b in reversed(today) if b.get("kind") == "sports"), None)
+        if anchor is None:
+            anchor = max(today, key=lambda b: b["end"])
+
+        start_h = int(anchor["end"][:2])
+        start_m = 0 if int(anchor["end"][3:]) < 30 else 30
+
+        dur_h = re.search(r'(\d+)\s*hour', low)
+        dur_m = re.search(r'(\d+)\s*(?:min|mins|minutes)', low)
+        if dur_h:
+            num_slots = min(self.MAX_SLOTS_PER_DAY, int(dur_h.group(1)) * 2)
+        elif dur_m:
+            num_slots = max(1, min(self.MAX_SLOTS_PER_DAY, round(int(dur_m.group(1)) / 30)))
+        else:
+            num_slots = 4  # default 2 hours
+
+        # Library daily slot limit (sports bookings don't count)
+        used = sum(b["num_slots"] for b in today if b.get("kind") != "sports")
+        remaining = self.MAX_SLOTS_PER_DAY - used
+        if remaining <= 0:
+            return (f"You've used your 2-hour daily library limit for {date_str}, "
+                    f"so I can't add a study room after your {anchor['room_id']} booking.")
+        num_slots = min(num_slots, remaining)
+
+        floor = _parse_floor_pref(low)
+        capacity = _parse_capacity(low)
+        result = find_best_room(date_str, start_h, start_m, num_slots, capacity,
+                                preferred_floor=floor)
+
+        end_h = start_h + (start_m + num_slots * 30) // 60
+        end_m = (start_m + num_slots * 30) % 60
+        after = f"after your {anchor['room_id']} booking ends at {anchor['end']}"
+
+        if not result.get("found"):
+            where = f" on {floor}" if floor else ""
+            alt = ""
+            if result.get("alt_times"):
+                alts = [f"{t} ({rm})" for t, rm, _ in result["alt_times"][:2]]
+                alt = f" Free instead at: {', '.join(alts)}."
+            return (f"No study room{where} is free {start_h:02d}:{start_m:02d}–"
+                    f"{end_h:02d}:{end_m:02d} ({after}).{alt}")
+
+        room_id = result["room_id"]
+        room_info = LC_ROOMS.get(room_id) or STUDY_ROOMS.get(room_id)
+        self.pending_booking = {
+            "room_id": room_id, "date": date_str, "hour": start_h,
+            "minute": start_m, "num_slots": num_slots, "capacity": result["capacity"],
+        }
+        return (
+            f"Nice — {after}, you can study here:\n\n"
+            f"📚 **{room_id}** ({room_info['type']}, {room_info['floor']}, "
+            f"seats {room_info['capacity']}) is free "
+            f"{start_h:02d}:{start_m:02d}–{end_h:02d}:{end_m:02d}.\n\n"
+            f"Shall I book {room_id}?"
+        )
 
     def _do_booking_search(
         self, date: str, hour: int, minute: int,
@@ -1061,4 +1483,7 @@ RESPONSE RULES:
         self._edit_after_cancel = False
         self._rejected_booking_ctx = None
         self._pending_edit = None
+        self.pending_sports = None
+        self._waiting_sports_time = None
+        self._plan_ctx = None
         logger.info("Cleanup done")

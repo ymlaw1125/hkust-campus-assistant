@@ -26,3 +26,5 @@ venv/
 
 # Dev tool directories
 /devTools/
+
+bookings_db.json

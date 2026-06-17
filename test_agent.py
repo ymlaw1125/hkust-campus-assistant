@@ -59,6 +59,7 @@ def make_agent():
     a._pending_edit = None
     a.pending_sports = None
     a._waiting_sports_time = None
+    a._pending_multi = None
     a._plan_ctx = None
     a.client = None
     a.deployment = "stub"
@@ -131,12 +132,29 @@ async def main():
     print(f"    (planned arrival slot: {arr_h:02d}:{arr_m:02d}, room {r.agent.pending_booking['room_id']})")
 
     print("\n" + "=" * 70)
-    print("TEST 4 — Floor preference change while pending (want LG1)")
+    print("TEST 4 — Floor preference change while pending")
     print("=" * 70)
     prev_room = r.agent.pending_booking["room_id"]
-    reply = await r.say("actually i want one in lg1")
+    cur_floor = (library_client.LC_ROOMS.get(prev_room) or library_client.STUDY_ROOMS.get(prev_room))["floor"]
+    n_slots = r.agent.pending_booking["num_slots"]
+    # Choose a different floor; whether it's free at the (clock-derived) pending slot
+    # varies by date/time, so assert the correct behaviour in BOTH cases.
+    target_floor = next((f for f in ["LG1", "LG3", "LG4", "1/F"]
+                         if f != cur_floor and
+                         library_client.find_best_room(DATE, arr_h, arr_m, n_slots, 1,
+                                                       preferred_floor=f)["found"]), None)
+    if target_floor is None:
+        # Nothing else free at this slot — agent should keep the original booking, not crash.
+        reply = await r.say("actually i want one in lg1")
+        r.check("kept a valid pending booking when no alt floor is free",
+                r.agent.pending_booking is not None)
+    else:
+        phrase = {"LG1": "lg1", "LG3": "lg3", "LG4": "lg4", "1/F": "1f"}[target_floor]
+        reply = await r.say(f"actually i want one in {phrase}")
+        new_floor = (library_client.LC_ROOMS.get(r.agent.pending_booking["room_id"]) or
+                     library_client.STUDY_ROOMS.get(r.agent.pending_booking["room_id"]))["floor"]
+        r.check("repriced to the requested floor", new_floor == target_floor)
     new_room = r.agent.pending_booking["room_id"]
-    r.check("new room is on LG1", new_room.startswith("LG1"))
     r.check("same time window kept", r.agent.pending_booking["hour"] == arr_h and r.agent.pending_booking["minute"] == arr_m)
 
     print("\n" + "=" * 70)
@@ -148,7 +166,7 @@ async def main():
     r.check("reference is real (DEMO-)", r.agent.my_bookings[0]["ref"].startswith("DEMO-"))
     booked_room = r.agent.my_bookings[0]["room_id"]
     booked_ref = r.agent.my_bookings[0]["ref"]
-    r.check("booked room is the LG1 one", booked_room == new_room)
+    r.check("booked room is the repriced one", booked_room == new_room)
     r.check("slot persisted in db", db.is_booked(DATE, booked_room, arr_h, arr_m))
 
     print("\n" + "=" * 70)
@@ -177,23 +195,24 @@ async def main():
                                           preferred_floor=fl)["found"]),
         None,
     )
-    r.check("an alternative floor is free today", target_floor is not None)
-    floor_phrase = {"LG3": "lg3", "LG4": "lg4", "1/F": "1f"}[target_floor]
-    reply = await r.say(f"change my booking to a {floor_phrase} room")
-    r.check("pending edit created", r.agent._pending_edit is not None)
-    r.check("edit target on chosen floor",
-            r.agent._pending_edit and
-            (library_client.LC_ROOMS.get(r.agent._pending_edit["room_id"]) or
-             library_client.STUDY_ROOMS.get(r.agent._pending_edit["room_id"]))["floor"] == target_floor)
-    r.check("edit keeps same time", r.agent._pending_edit and r.agent._pending_edit["hour"] == arr_h)
-    reply = await r.say("yes")
-    r.check("edit applied", "Changed" in reply)
-    r.check("still one booking", len(r.agent.my_bookings) == 1)
-    r.check("new room on chosen floor",
-            (library_client.LC_ROOMS.get(r.agent.my_bookings[0]["room_id"]) or
-             library_client.STUDY_ROOMS.get(r.agent.my_bookings[0]["room_id"]))["floor"] == target_floor)
-    r.check("old LG1 slot released in db", not db.is_booked(DATE, booked_room, arr_h, arr_m))
-    new_ref = r.agent.my_bookings[0]["ref"]
+    if target_floor is None:
+        r.check("(skipped — no alternative floor has a 2h slot at this hour today)", True)
+    else:
+        floor_phrase = {"LG3": "lg3", "LG4": "lg4", "1/F": "1f"}[target_floor]
+        reply = await r.say(f"change my booking to a {floor_phrase} room")
+        r.check("pending edit created", r.agent._pending_edit is not None)
+        r.check("edit target on chosen floor",
+                r.agent._pending_edit and
+                (library_client.LC_ROOMS.get(r.agent._pending_edit["room_id"]) or
+                 library_client.STUDY_ROOMS.get(r.agent._pending_edit["room_id"]))["floor"] == target_floor)
+        r.check("edit keeps same time", r.agent._pending_edit and r.agent._pending_edit["hour"] == arr_h)
+        reply = await r.say("yes")
+        r.check("edit applied", "Changed" in reply)
+        r.check("still one booking", len(r.agent.my_bookings) == 1)
+        r.check("new room on chosen floor",
+                (library_client.LC_ROOMS.get(r.agent.my_bookings[0]["room_id"]) or
+                 library_client.STUDY_ROOMS.get(r.agent.my_bookings[0]["room_id"]))["floor"] == target_floor)
+        r.check("old LG1 slot released in db", not db.is_booked(DATE, booked_room, arr_h, arr_m))
 
     print("\n" + "=" * 70)
     print("TEST 9 — Cancel booking")
@@ -315,7 +334,7 @@ async def main():
     r.check("squash venue picked", r.agent.pending_sports["facility"] == "SQUASH-LG4")
 
     print("\n" + "=" * 70)
-    print("TEST 18 — 1 slot per facility per day enforced")
+    print("TEST 18 — 1 slot per SPORT per day (all venues share the quota)")
     print("=" * 70)
     reset_db()
     r.agent.my_bookings = []
@@ -327,8 +346,33 @@ async def main():
     await r.say("yes")
     r.check("first squash booking made", len(r.agent.my_bookings) == 1)
     reply = await r.say(f"book squash at {free_hrs[1]}:00")
-    r.check("second squash booking blocked", "already used" in reply.lower())
+    r.check("second squash booking blocked", "one slot per sport per day" in reply.lower())
     r.check("no second pending", r.agent.pending_sports is None)
+    # Football: both pitches are the SAME sport → second pitch also blocked
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    fh = _free_sport_hour("football", 8, 22)
+    await r.say(f"book the turf soccer pitch at {fh}:00")
+    await r.say("yes")
+    first_pitch = r.agent.my_bookings[0]["fac_id"]
+    reply = await r.say(f"book the mini soccer pitch at {fh}:00")
+    r.check("second soccer pitch blocked (same sport)", "one slot per sport per day" in reply.lower())
+
+    print("\n" + "=" * 70)
+    print("TEST 18b — Different sports are independent (TT + badminton both allowed)")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    tth = _free_sport_hour("table_tennis", 9, 22)
+    await r.say(f"book table tennis at {tth}:00")
+    await r.say("yes")
+    bdh = _free_sport_hour("badminton", 9, 22)
+    reply = await r.say(f"book badminton at {bdh}:00")
+    r.check("badminton NOT blocked by the table-tennis booking", r.agent.pending_sports is not None)
+    await r.say("yes")
+    r.check("both sports booked", len(r.agent.my_bookings) == 2)
 
     print("\n" + "=" * 70)
     print("TEST 19 — $SPORTS returns a bounded table")
@@ -534,6 +578,431 @@ async def main():
         r.check("recorded one sports booking", len(r.agent.my_bookings) == 1)
     else:
         r.check("(skipped — no fully-booked badminton hour today)", True)
+
+    print("\n" + "=" * 70)
+    print("TEST 31 — Misspelled sport ('badinton') still routes to sports")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    bh = _free_sport_hour("badminton", 9, 22)
+    reply = await r.say(f"book badinton at {bh}:00")
+    r.check("misspelling recognized as a sports request", r.agent.pending_sports is not None)
+    r.check("resolved to badminton", r.agent.pending_sports and r.agent.pending_sports["sport"] == "badminton")
+
+    print("\n" + "=" * 70)
+    print("TEST 32 — Sports booking does NOT consume the library 2-hour limit")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    sh = _free_sport_hour("squash", 8, 22)
+    await r.say(f"book squash at {sh}:00")
+    await r.say("yes")
+    r.check("one sports booking", len(r.agent.my_bookings) == 1)
+    lh = next((h for h in range(8, 21)
+               if library_client.find_best_room(DATE, h, 0, 4, 1)["found"]), None)
+    reply = await r.say(f"book a study room at {lh}:00 for 2 hours")
+    r.check("library NOT blocked by the sports booking", "SLOT LIMIT" not in reply.upper())
+    r.check("library room recommended", r.agent.pending_booking is not None)
+    await r.say("yes")
+    r.check("now two bookings (sport + 2h library)", len(r.agent.my_bookings) == 2)
+
+    print("\n" + "=" * 70)
+    print("TEST 33 — 'cancel the pingpong and book badminton' swaps in one go")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    th = next((h for h in range(9, 21)
+               if sports_client.free_courts(DATE, "TT-LG1031", "table_tennis", 6, h) > 0
+               and (sports_client.free_courts(DATE, "SHHO", "badminton", 4, h) > 0
+                    or sports_client.free_courts(DATE, "ARENA", "badminton", 4, h) > 0)), None)
+    r.check("found an hour with TT and badminton free", th is not None)
+    await r.say(f"book table tennis at {th}:00")
+    await r.say("yes")
+    r.check("table tennis booked", r.agent.my_bookings and r.agent.my_bookings[0]["sport"] == "table_tennis")
+    reply = await r.say("cancel the pingpong and book badminton")
+    r.check("cancelled the table-tennis booking", "Cancelled" in reply)
+    r.check("offered a badminton court (pending)", r.agent.pending_sports is not None)
+    r.check("new pending sport is badminton", r.agent.pending_sports and r.agent.pending_sports["sport"] == "badminton")
+    r.check("table-tennis booking removed", all(b.get("sport") != "table_tennis" for b in r.agent.my_bookings))
+    await r.say("yes")
+    r.check("badminton now booked", any(b.get("sport") == "badminton" for b in r.agent.my_bookings))
+
+    print("\n" + "=" * 70)
+    print("TEST 34 — 'study at lg3 after pingpong' chains deterministically (no LLM)")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    th = next((h for h in range(9, 20)
+               if sports_client.find_available_venue(DATE, "table_tennis", h)["status"] == "ok"
+               and library_client.find_best_room(DATE, h + 1, 0, 4, 1, preferred_floor="LG3")["found"]
+               and h + 3 <= 22), None)
+    r.check("found a chainable TT+LG3 slot", th is not None)
+    await r.say(f"book table tennis at {th}:00")
+    await r.say("yes")
+    reply = await r.say("i wanna sstudy at lg3 after pingpong")
+    r.check("handled deterministically (no LLM stub)", "<LLM>" not in reply)
+    r.check("library room recommended", r.agent.pending_booking is not None)
+    r.check("starts when table tennis ends", r.agent.pending_booking and r.agent.pending_booking["hour"] == th + 1)
+    r.check("on LG3",
+            r.agent.pending_booking and
+            (library_client.LC_ROOMS.get(r.agent.pending_booking["room_id"]) or
+             library_client.STUDY_ROOMS.get(r.agent.pending_booking["room_id"]))["floor"] == "LG3")
+    reply = await r.say("yes thanks")
+    r.check("real DEMO reference (not hallucinated)", "DEMO-" in reply)
+    r.check("two bookings: table tennis + study", len(r.agent.my_bookings) == 2)
+
+    print("\n" + "=" * 70)
+    print("TEST 35 — Multi-chain: 'after badminton, table tennis, then study 1h at lg3'")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    r.agent._pending_multi = None
+    # Need: badminton@bh free; table tennis@bh+1 free; LG3 free 1h at bh+2.
+    chain = None
+    for bh in range(9, 18):
+        if sports_client.find_available_venue(DATE, "badminton", bh)["status"] != "ok":
+            continue
+        if sports_client.find_available_venue(DATE, "table_tennis", bh + 1)["status"] != "ok":
+            continue
+        if not library_client.find_best_room(DATE, bh + 2, 0, 2, 1, preferred_floor="LG3")["found"]:
+            continue
+        chain = bh
+        break
+    r.check("found a viable badminton→TT→study chain", chain is not None)
+    bh = chain
+    await r.say(f"book badminton at {bh}:00")
+    await r.say("yes")
+    reply = await r.say("after badminton, i wanna play table tennis, and then study for an hour at lg3")
+    r.check("built a multi-step plan", r.agent._pending_multi is not None)
+    multi_plan = (r.agent._pending_multi or {}).get("plan", [])
+    r.check("plan has 2 new items", len(multi_plan) == 2)
+    p_sport = next((p for p in multi_plan if p["kind"] == "sports"), None)
+    p_lib = next((p for p in multi_plan if p["kind"] == "library"), None)
+    r.check("table tennis right after badminton", p_sport and p_sport["sport"] == "table_tennis" and p_sport["hour"] == bh + 1)
+    r.check("study right after table tennis", p_lib and p_lib["hour"] == bh + 2)
+    r.check("study is 1 hour (2 slots), not 2h", p_lib and p_lib["num_slots"] == 2)
+    r.check("study on LG3", p_lib and p_lib["floor"] == "LG3")
+    reply = await r.say("yes")
+    r.check("all three booked (badminton + TT + study)", len(r.agent.my_bookings) == 3)
+    r.check("real refs, no hallucination", reply.count("DEMO-") == 2)
+    r.check("no LLM fallback used", "<LLM>" not in reply)
+
+    print("\n" + "=" * 70)
+    print("TEST 36 — Sport swap: 'instead of table tennis, I'll play basketball'")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    def _bball_free(h):
+        return any(sports_client.free_courts(DATE, v["id"], "basketball", v["courts"], h) > 0
+                   for v in sports_client.SPORT_VENUES["basketball"])
+    sh = next((h for h in range(9, 21)
+               if sports_client.find_available_venue(DATE, "table_tennis", h)["status"] == "ok"
+               and _bball_free(h)), None)
+    r.check("found hour with TT and basketball free", sh is not None)
+    await r.say(f"book table tennis at {sh}:00")
+    await r.say("yes")
+    r.check("table tennis booked", r.agent.my_bookings[0]["sport"] == "table_tennis")
+    reply = await r.say("actually instead of table tennis, ill play basketball")
+    r.check("told it cancelled the table tennis", "Cancelled" in reply)
+    r.check("now offering basketball (pending)", r.agent.pending_sports is not None)
+    r.check("pending sport is basketball", r.agent.pending_sports and r.agent.pending_sports["sport"] == "basketball")
+    r.check("kept the same hour", r.agent.pending_sports and r.agent.pending_sports["hour"] == sh)
+    r.check("table tennis removed", all(b.get("sport") != "table_tennis" for b in r.agent.my_bookings))
+    reply = await r.say("yes")
+    r.check("basketball booked", any(b.get("sport") == "basketball" for b in r.agent.my_bookings))
+    r.check("did not double-book (still one sports booking)",
+            sum(1 for b in r.agent.my_bookings if b.get("kind") == "sports") == 1)
+
+    print("\n" + "=" * 70)
+    print("TEST 37 — Multi-plan: 'same place' venue + revise one item, keep the rest")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    r.agent._pending_multi = None
+    # badminton@h at SHHO; basketball@h+1 free at SHHO; LG3 free 2h at h+2
+    h0 = None
+    for h in range(9, 17):
+        if sports_client.free_courts(DATE, "SHHO", "badminton", 4, h) <= 0:
+            continue
+        if sports_client.free_courts(DATE, "SHHO", "basketball", 1, h + 1) <= 0:
+            continue
+        if not library_client.find_best_room(DATE, h + 2, 0, 4, 1, preferred_floor="LG3")["found"]:
+            continue
+        h0 = h
+        break
+    r.check("found SHHO badminton+basketball+LG3 chain", h0 is not None)
+    await r.say(f"book badminton at sports hall at {h0}:00")
+    await r.say("yes")
+    r.check("badminton at SHHO", r.agent.my_bookings[0]["fac_id"] == "SHHO")
+    reply = await r.say("after that i want to play basketball at the same place, then study 2 hours at lg3")
+    plan = (r.agent._pending_multi or {}).get("plan", [])
+    bball = next((p for p in plan if p.get("sport") == "basketball"), None)
+    r.check("'same place' put basketball at SHHO", bball and bball["facility"] == "SHHO")
+    # Now revise ONLY the study floor; basketball + times must be preserved
+    reply = await r.say("actually make the study at lg4")
+    plan2 = (r.agent._pending_multi or {}).get("plan", [])
+    r.check("plan still intact (2 items)", len(plan2) == 2)
+    bball2 = next((p for p in plan2 if p.get("sport") == "basketball"), None)
+    lib2 = next((p for p in plan2 if p["kind"] == "library"), None)
+    r.check("basketball venue preserved (SHHO)", bball2 and bball2["facility"] == "SHHO")
+    r.check("study floor revised to LG4", lib2 and lib2["floor"] == "LG4")
+    r.check("study still 2h (4 slots)", lib2 and lib2["num_slots"] == 4)
+    reply = await r.say("yes")
+    r.check("all booked (badminton + basketball + study)", len(r.agent.my_bookings) == 3)
+
+    def _setup_chain():
+        """Book badminton@SHHO and stage a basketball@SHHO + LG3-study plan; return (h0, plan)."""
+        reset_db()
+        r.agent.my_bookings = []
+        r.agent.pending_sports = None
+        r.agent.pending_booking = None
+        r.agent._pending_multi = None
+        h0 = None
+        for h in range(9, 16):
+            if sports_client.free_courts(DATE, "SHHO", "badminton", 4, h) <= 0:
+                continue
+            if sports_client.free_courts(DATE, "SHHO", "basketball", 1, h + 1) <= 0:
+                continue
+            if not library_client.find_best_room(DATE, h + 2, 0, 4, 1, preferred_floor="LG3")["found"]:
+                continue
+            if not library_client.find_best_room(DATE, h + 2, 0, 2, 1, preferred_floor="LG3")["found"]:
+                continue
+            h0 = h
+            break
+        return h0
+
+    print("\n" + "=" * 70)
+    print("TEST 38 — Revise study DURATION mid-plan (2h → 1h), keep the rest")
+    print("=" * 70)
+    h0 = _setup_chain()
+    r.check("found a setup hour for duration test", h0 is not None)
+    await r.say(f"book badminton at sports hall at {h0}:00")
+    await r.say("yes")
+    await r.say("after that basketball at the same place, then study 2 hours at lg3")
+    plan = (r.agent._pending_multi or {}).get("plan", [])
+    lib0 = next((p for p in plan if p["kind"] == "library"), None)
+    r.check("study starts as 2h (4 slots)", lib0 and lib0["num_slots"] == 4)
+    await r.say("actually make the study just 1 hour instead")
+    plan2 = (r.agent._pending_multi or {}).get("plan", [])
+    bball = next((p for p in plan2 if p.get("sport") == "basketball"), None)
+    lib = next((p for p in plan2 if p["kind"] == "library"), None)
+    r.check("study now 1 hour (2 slots)", lib and lib["num_slots"] == 2)
+    r.check("study still on LG3", lib and lib["floor"] == "LG3")
+    r.check("basketball preserved at SHHO", bball and bball["facility"] == "SHHO" and bball["hour"] == h0 + 1)
+    r.check("study still starts right after basketball", lib and lib["hour"] == h0 + 2)
+    await r.say("yes")
+    r.check("all three booked", len(r.agent.my_bookings) == 3)
+
+    print("\n" + "=" * 70)
+    print("TEST 39 — Revise an item's TIME mid-plan ('start the study at HH')")
+    print("=" * 70)
+    h0 = _setup_chain()
+    r.check("found a setup hour for time test", h0 is not None)
+    fh = next((h for h in range(h0 + 3, 21)
+               if library_client.find_best_room(DATE, h, 0, 2, 1, preferred_floor="LG3")["found"]), None)
+    r.check("found a later free study hour", fh is not None)
+    await r.say(f"book badminton at sports hall at {h0}:00")
+    await r.say("yes")
+    await r.say("after that basketball at the same place, then study an hour at lg3")
+    await r.say(f"actually start the study at {fh}:00")
+    plan3 = (r.agent._pending_multi or {}).get("plan", [])
+    bball = next((p for p in plan3 if p.get("sport") == "basketball"), None)
+    lib = next((p for p in plan3 if p["kind"] == "library"), None)
+    r.check("study moved to the requested time", lib and lib["hour"] == fh)
+    r.check("basketball preserved at SHHO right after badminton",
+            bball and bball["facility"] == "SHHO" and bball["hour"] == h0 + 1)
+    await r.say("yes")
+    r.check("both booked after time change", len(r.agent.my_bookings) == 3)
+
+    print("\n" + "=" * 70)
+    print("TEST 40 — No time given → agent offers available slots to choose")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    reply = await r.say("book a badminton court")
+    r.check("offers free slots to pick", "Free 1-hour slots" in reply and "•" in reply)
+    r.check("waiting for a time", r.agent._waiting_sports_time is not None)
+    fhh = _free_sport_hour("badminton", 9, 22)
+    reply = await r.say(f"{fhh}:00")
+    r.check("picking a listed time books it", r.agent.pending_sports is not None)
+
+    print("\n" + "=" * 70)
+    print("TEST 41 — Swap the study/basketball times in a pending plan")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    r.agent._pending_multi = None
+    hs = None
+    for h in range(9, 15):
+        if sports_client.free_courts(DATE, "SHHO", "badminton", 4, h) <= 0:
+            continue
+        if sports_client.free_courts(DATE, "SHHO", "basketball", 1, h + 1) <= 0:
+            continue
+        if sports_client.free_courts(DATE, "SHHO", "basketball", 1, h + 2) <= 0:
+            continue
+        if not library_client.find_best_room(DATE, h + 1, 0, 2, 1, preferred_floor="LG3")["found"]:
+            continue
+        if not library_client.find_best_room(DATE, h + 2, 0, 2, 1, preferred_floor="LG3")["found"]:
+            continue
+        hs = h
+        break
+    r.check("found a swap-test setup", hs is not None)
+    await r.say(f"book badminton at sports hall at {hs}:00")
+    await r.say("yes")
+    await r.say("after that basketball at the same place, then study an hour at lg3")
+    await r.say("swap the study and basketball times")
+    plan = (r.agent._pending_multi or {}).get("plan", [])
+    bball = next((p for p in plan if p.get("sport") == "basketball"), None)
+    lib = next((p for p in plan if p["kind"] == "library"), None)
+    r.check("study now in the earlier slot", lib and lib["hour"] == hs + 1)
+    r.check("basketball now in the later slot", bball and bball["hour"] == hs + 2)
+    r.check("basketball stayed at SHHO (locked venue)", bball and bball["facility"] == "SHHO")
+
+    print("\n" + "=" * 70)
+    print("TEST 42 — Locked venue: warn (don't substitute) when it's full at the new time")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    r.agent._pending_multi = None
+    h1 = next((h for h in range(9, 14)
+               if sports_client.free_courts(DATE, "SHHO", "badminton", 4, h) > 0
+               and sports_client.free_courts(DATE, "SHHO", "basketball", 1, h + 1) > 0
+               and library_client.find_best_room(DATE, h + 2, 0, 2, 1, preferred_floor="LG3")["found"]), None)
+    r.check("found a lock-warn setup", h1 is not None)
+    full_h = h1 + 4 if h1 + 4 <= 21 else h1 + 3
+    # Occupy the single SHHO court at full_h so the locked venue is unavailable there.
+    db.add_booking(DATE, "SHHO", full_h, 0, 1, "OCCUPY-TEST")
+    r.check("forced hour is full for SHHO basketball",
+            sports_client.free_courts(DATE, "SHHO", "basketball", 1, full_h) == 0)
+    await r.say(f"book badminton at sports hall at {h1}:00")
+    await r.say("yes")
+    await r.say("after that basketball at the same place, then study an hour at lg3")
+    before = (r.agent._pending_multi or {}).get("plan", [])
+    bb_before = next((p for p in before if p.get("sport") == "basketball"), None)["hour"]
+    reply = await r.say(f"actually start the basketball at {full_h}:00")
+    r.check("warned that the locked venue has no court", "S. H. Ho Sports Hall has no" in reply)
+    r.check("said the plan is unchanged", "unchanged" in reply.lower())
+    after = (r.agent._pending_multi or {}).get("plan", [])
+    bb_after = next((p for p in after if p.get("sport") == "basketball"), None)["hour"]
+    r.check("basketball time was NOT changed", bb_after == bb_before)
+
+    print("\n" + "=" * 70)
+    print("TEST 43 — Misspelled sport ('basketbal') still chains correctly")
+    print("=" * 70)
+    r.check("resolve_sport('basketbal') == basketball", sports_client.resolve_sport("basketbal") == "basketball")
+    r.check("resolve_sport('basket ball') == basketball", sports_client.resolve_sport("basket ball") == "basketball")
+    h0 = _setup_chain()
+    r.check("found setup for misspelling chain", h0 is not None)
+    await r.say(f"book badminton at sports hall at {h0}:00")
+    await r.say("yes")
+    reply = await r.say("after badminton i wanna play basketbal at the same place then study 2 hours at lg3")
+    plan = (r.agent._pending_multi or {}).get("plan", [])
+    r.check("multi-plan built despite misspelling", len(plan) == 2)
+    bball = next((p for p in plan if p.get("sport") == "basketball"), None)
+    r.check("basketball recognized + at SHHO", bball and bball["facility"] == "SHHO")
+
+    print("\n" + "=" * 70)
+    print("TEST 44 — Chain honors 'same place' strictly (warn, don't substitute)")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    r.agent._pending_multi = None
+    # badminton@SHHO@h0; occupy SHHO basketball for the whole window so 'same place' can't be honored
+    h0 = next((h for h in range(9, 14)
+               if sports_client.free_courts(DATE, "SHHO", "badminton", 4, h) > 0
+               and library_client.find_best_room(DATE, h + 1, 0, 4, 1)["found"]), None)
+    r.check("found setup for strict-venue test", h0 is not None)
+    for hh in range(h0 + 1, h0 + 6):
+        db.add_booking(DATE, "SHHO", hh, 0, 1, f"OCCUPY-{hh}")
+    await r.say(f"book badminton at sports hall at {h0}:00")
+    await r.say("yes")
+    reply = await r.say("after badminton, basketball at the same place, then study 2 hours")
+    r.check("warned SHHO has no basketball court", "S. H. Ho Sports Hall has no" in reply)
+    plan = (r.agent._pending_multi or {}).get("plan", [])
+    r.check("did NOT silently substitute Outdoor",
+            not any(p.get("facility") == "BBALL-OUT" for p in plan))
+
+    print("\n" + "=" * 70)
+    print("TEST 45 — 'change my study room to lg3' targets the LIBRARY booking")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    r.agent._pending_edit = None
+    # Make a sports booking AND a library booking; the library one must be the target.
+    sp_h = _free_sport_hour("badminton", 9, 22)
+    await r.say(f"book badminton at {sp_h}:00")
+    await r.say("yes")
+    lh = next((h for h in range(9, 20)
+               if library_client.find_best_room(DATE, h, 0, 2, 1, preferred_floor="LG1")["found"]
+               and library_client.find_best_room(DATE, h, 0, 2, 1, preferred_floor="LG3")["found"]), None)
+    r.check("found a library hour with LG1+LG3 free", lh is not None)
+    await r.say(f"book a study room in lg1 at {lh}:00 for 1 hour")
+    await r.say("yes")
+    lib_ref = next(b["ref"] for b in r.agent.my_bookings if b.get("kind") != "sports")
+    reply = await r.say("change my study room to a lg3 room")
+    r.check("did NOT mis-target the sports booking", "can't be moved" not in reply.lower())
+    r.check("started a library edit to LG3",
+            r.agent._pending_edit is not None and
+            (library_client.LC_ROOMS.get(r.agent._pending_edit["room_id"]) or
+             library_client.STUDY_ROOMS.get(r.agent._pending_edit["room_id"]))["floor"] == "LG3")
+
+    print("\n" + "=" * 70)
+    print("TEST 46 — 'I prefer LG1 to study' edits the existing study booking (no LLM)")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    r.agent._pending_edit = None
+    # A sports booking AND a study booking on LG3, with LG1 free at the same hour.
+    sp = _free_sport_hour("badminton", 9, 22)
+    await r.say(f"book badminton at {sp}:00")
+    await r.say("yes")
+    lh = next((h for h in range(9, 20)
+               if library_client.find_best_room(DATE, h, 0, 2, 1, preferred_floor="LG3")["found"]
+               and library_client.find_best_room(DATE, h, 0, 2, 1, preferred_floor="LG1")["found"]), None)
+    r.check("found an LG3+LG1 hour", lh is not None)
+    lg3room = library_client.find_best_room(DATE, lh, 0, 2, 1, preferred_floor="LG3")["room_id"]
+    await r.say(f"book {lg3room} at {lh}:00 for 1 hour")
+    await r.say("yes")
+    r.check("two bookings (badminton + LG3 study)", len(r.agent.my_bookings) == 2)
+    reply = await r.say("actually i prefer lg1 to study")
+    r.check("did NOT mis-target the sports booking", "can't be moved" not in reply.lower())
+    r.check("started a deterministic edit (no LLM stub)", "<LLM>" not in reply and r.agent._pending_edit is not None)
+    r.check("edit target is on LG1",
+            r.agent._pending_edit and
+            (library_client.LC_ROOMS.get(r.agent._pending_edit["room_id"]) or
+             library_client.STUDY_ROOMS.get(r.agent._pending_edit["room_id"]))["floor"] == "LG1")
+    r.check("edit keeps the same hour", r.agent._pending_edit and r.agent._pending_edit["hour"] == lh)
+    reply = await r.say("any. just book thanks")   # exercises the new confirm phrase
+    r.check("edit applied via 'just book'", "Changed" in reply)
+    r.check("still two bookings", len(r.agent.my_bookings) == 2)
+    r.check("study now on LG1",
+            any(b["room_id"].startswith("LG1-R") for b in r.agent.my_bookings))
+    r.check("badminton untouched", any(b.get("sport") == "badminton" for b in r.agent.my_bookings))
 
     # ── Summary ──────────────────────────────────────────────────────────────
     reset_db()

@@ -1,5 +1,6 @@
 # Copyright (c) Microsoft. All rights reserved.
 
+import asyncio
 import logging
 import os
 import re
@@ -8,6 +9,7 @@ import datetime as dt
 from datetime import datetime
 from typing import Optional
 
+import httpx
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 from azure.identity import AzureCliCredential, get_bearer_token_provider
@@ -44,6 +46,7 @@ from sports_client import (
     SPORT_INFO,
     SPORT_LABELS,
     SPORT_VENUES,
+    SPORT_ALIASES,
     FACILITIES,
 )
 
@@ -343,7 +346,7 @@ LIBRARY (lbbooking.ust.hk):
 - Hours: 8am–11pm.
 
 SPORTS FACILITIES (fbs.hkust.edu.hk):
-- 1-hour slots, 1 slot per facility per day, booking opens 8am 7 days ahead.
+- 1-hour slots, 1 slot per sport per day (all venues of a sport share one quota), booking opens 8am 7 days ahead.
 - Bookable: badminton, squash, table tennis, tennis, basketball, football, volleyball, handball, netball, pickleball, climbing, gym, dance, fencing, martial arts, archery.
 - Walk-in (no booking): running (400m track), swimming (pool).
 - Contact only: water sports (dragon boat, rowing, windsurfing, kayaking, sailing).
@@ -387,37 +390,76 @@ RESPONSE RULES:
         self._pending_edit: Optional[dict] = None
         self.pending_sports: Optional[dict] = None
         self._waiting_sports_time: Optional[dict] = None
+        self._pending_multi: Optional[list] = None
         self._plan_ctx: Optional[dict] = None
         self._create_client()
 
     def _create_client(self):
+        load_dotenv(override=True)  # ensure .env wins over any injected/stale process env
         endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         endpoint = endpoint.rstrip("/").replace("/openai/v1", "").replace("/openai", "")
         deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
         api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+        self.deployment = deployment
 
+        # HTTP client for the model calls. By default we IGNORE proxy env vars
+        # (HTTP_PROXY/HTTPS_PROXY) and connect directly to Azure — a local proxy
+        # (e.g. 127.0.0.1:8118) often can't tunnel to the model endpoint and yields
+        # "APIConnectionError: Connection error". Azure is directly reachable, so
+        # trust_env=False is the reliable choice. Set AZURE_USE_PROXY=1 to opt back in.
+        use_proxy = os.getenv("AZURE_USE_PROXY", "").strip() in ("1", "true", "True")
+        http_client = httpx.Client(trust_env=use_proxy, timeout=60.0)
+
+        # ── Preferred: API-key auth ───────────────────────────────────────────
+        # Reliable and instant — avoids the Azure CLI / managed-identity probing
+        # that fails when `az` isn't on the debug process PATH. Set AZURE_OPENAI_API_KEY
+        # in .env (Azure Portal → your AI resource → Keys and Endpoint).
+        api_key = (os.getenv("AZURE_OPENAI_API_KEY") or "").strip()
+        if api_key and api_key.lower() != "placeholder":
+            self.client = AzureOpenAI(
+                azure_endpoint=endpoint,
+                api_key=api_key,
+                api_version=api_version,
+                http_client=http_client,
+            )
+            logger.info(f"✅ Client created (API key, direct) → {deployment}")
+            return
+
+        # ── Fallback: Microsoft Entra (AAD) token ─────────────────────────────
+        # NOTE: this path is much slower and brittle (needs `az` on the process PATH).
+        # Prefer the API key above. We bound the CLI probe and skip the managed-identity
+        # (IMDS) probe, which otherwise hangs for ~seconds on non-Azure machines.
+        logger.warning("AZURE_OPENAI_API_KEY not set — falling back to Entra auth "
+                       "(slower; set the key in .env for instant, reliable responses).")
         try:
-            credential = AzureCliCredential()
+            credential = AzureCliCredential(process_timeout=8)
             token_provider = get_bearer_token_provider(credential, "https://ai.azure.com/.default")
             token_provider()
             logger.info("Using Azure CLI credential")
         except Exception:
             try:
                 from azure.identity import DefaultAzureCredential
-                credential = DefaultAzureCredential()
+                credential = DefaultAzureCredential(
+                    exclude_managed_identity_credential=True,
+                    exclude_shared_token_cache_credential=True,
+                    process_timeout=8,
+                )
                 token_provider = get_bearer_token_provider(credential, "https://ai.azure.com/.default")
                 logger.info("Using DefaultAzureCredential")
             except Exception as e:
-                raise ValueError(f"No valid Azure credential found: {e}")
+                raise ValueError(
+                    f"No valid Azure credential found: {e}. "
+                    f"Tip: set AZURE_OPENAI_API_KEY in .env to use key-based auth instead."
+                )
 
         self.client = AzureOpenAI(
             azure_endpoint=endpoint,
             azure_ad_token_provider=token_provider,
             api_version=api_version,
             api_key="placeholder",
+            http_client=http_client,
         )
-        self.deployment = deployment
-        logger.info(f"✅ Client created → {deployment}")
+        logger.info(f"✅ Client created (Entra token, direct) → {deployment}")
 
     async def initialize(self) -> None:
         logger.info("Agent ready")
@@ -463,10 +505,25 @@ RESPONSE RULES:
                 )
 
             confirm_words = {"yes", "yeah", "yep", "ok", "okay", "sure", "go ahead",
-                             "confirm", "book it", "do it", "please", "yup", "correct"}
+                             "confirm", "book it", "do it", "please", "yup", "correct",
+                             "just book", "book that", "book any", "book one", "sounds good",
+                             "go for it"}
             cancel_words  = {"no", "nope", "cancel", "don't", "dont", "nevermind",
                              "never mind", "stop", "skip", "abort", "not", "prefer",
                              "instead", "different", "another", "other", "change"}
+
+            # ── Multi-booking plan confirm flow (chained sequence) ────────
+            if self._pending_multi:
+                # A preference tweak ("no, basketball at the sports hall") revises the
+                # plan in place instead of discarding it.
+                revised = self._revise_multi(low)
+                if revised:
+                    return revised
+                if self._matches(low, confirm_words):
+                    return self._book_multi()
+                elif self._matches(low, cancel_words):
+                    self._pending_multi = None
+                    return "No problem — I haven't booked anything. Tell me what you'd like."
 
             # ── Edit-confirm flow (change an existing booking) ────────────
             if self._pending_edit:
@@ -494,6 +551,7 @@ RESPONSE RULES:
                             "ref": booking["booking_ref"],
                             "room_id": booking["name"],
                             "fac_id": ps["facility"],
+                            "sport": ps["sport"],
                             "date": booking["date"],
                             "start": booking["start"],
                             "end": booking["end"],
@@ -602,10 +660,29 @@ RESPONSE RULES:
             self._duration_context = None
             self._waiting_sports_time = None
 
+            # ── Sport swap: "instead of table tennis, I'll play basketball" ──
+            swap_reply = self._try_sport_swap(low, now)
+            if swap_reply:
+                return swap_reply
+
             # ── Cancel / edit / view-bookings intent ──────────────────────
-            edit_verbs   = ["change", "edit", "reschedule", "move", "switch", "swap", "rebook"]
-            booking_nouns = ["booking", "reservation", "room", "reserve"]
-            is_edit   = any(v in low for v in edit_verbs) and any(n in low for n in booking_nouns)
+            edit_verbs   = ["change", "edit", "reschedule", "move", "switch", "swap", "rebook", "replace"]
+            booking_nouns = ["booking", "reservation", "room", "reserve", "study", "court"]
+            is_edit_explicit = any(v in low for v in edit_verbs) and any(n in low for n in booking_nouns)
+
+            # Preference-based edit of an EXISTING booking, e.g. "I prefer LG1 to study"
+            # or "replace my study room" — route to the deterministic edit flow (not the
+            # LLM, which only shows availability). Only fires when a matching booking exists.
+            today_str = now.strftime("%Y-%m-%d")
+            today_bk = [b for b in self.my_bookings if b["date"] == today_str]
+            has_lib = any(b.get("kind") != "sports" for b in today_bk)
+            wants_lib_change = bool(_parse_floor_pref(low)) or "study" in low or "library" in low
+            named_sports_bk = any(b.get("kind") == "sports" and b.get("sport") in self._sports_in_text(low)
+                                  for b in today_bk)
+            pref_edit = (any(w in low for w in ["prefer", "rather", "replace", "instead"])
+                         and ((wants_lib_change and has_lib) or named_sports_bk))
+
+            is_edit = is_edit_explicit or pref_edit
             is_cancel = "cancel" in low and not is_edit
             is_my_bookings = (not is_edit and not is_cancel) and any(
                 k in low for k in ["my booking", "my bookings", "show booking", "show my",
@@ -622,18 +699,38 @@ RESPONSE RULES:
                 today_bookings = [b for b in self.my_bookings if b["date"] == today]
                 if not today_bookings:
                     return "You have no bookings to cancel today."
-                if len(today_bookings) == 1:
-                    b = today_bookings[0]
-                    self._pending_cancel_ref = b["ref"]
+
+                # Did they name a specific booking? ("cancel the pingpong", a room id…)
+                matched = [b for b in today_bookings if self._booking_matches(b, low)]
+                target = matched[0] if len(matched) == 1 else None
+                if target is None and len(today_bookings) == 1:
+                    target = today_bookings[0]
+
+                # Compound "cancel X and book/play Y" → swap to a different sport
+                if target and ("book" in low or "play" in low):
+                    tsport = target.get("sport")
+                    swap_sport = next((k for k in self._sports_in_text(low)
+                                       if k != tsport and k in SPORT_VENUES), None)
+                    if swap_sport:
+                        from db import cancel_booking as db_cancel
+                        db_cancel(target["ref"])
+                        self.my_bookings = [b for b in self.my_bookings if b["ref"] != target["ref"]]
+                        hour = int(target["start"][:2])  # reuse the freed slot's time
+                        search = self._do_sports_search(swap_sport, today, hour, 0)
+                        return (f"✅ Cancelled {target['room_id']} "
+                                f"({target['start']}–{target['end']}).\n\n{search}")
+
+                if target:
+                    self._pending_cancel_ref = target["ref"]
                     return (
-                        f"Cancel {b['room_id']} on {b['date']} {b['start']}–{b['end']} "
-                        f"(ref: {b['ref']})? Reply yes to confirm."
+                        f"Cancel {target['room_id']} on {target['date']} {target['start']}–{target['end']} "
+                        f"(ref: {target['ref']})? Reply yes to confirm."
                     )
-                else:
-                    lines = ["Which booking would you like to cancel? Reply with the room name or reference:"]
-                    for b in today_bookings:
-                        lines.append(f"• {b['room_id']} {b['start']}–{b['end']}  (ref: {b['ref']})")
-                    return "\n".join(lines)
+
+                lines = ["Which booking would you like to cancel? Reply with the room name or reference:"]
+                for b in today_bookings:
+                    lines.append(f"• {b['room_id']} {b['start']}–{b['end']}  (ref: {b['ref']})")
+                return "\n".join(lines)
 
             # ── Combined planning: "I'm at X, want to study/play/book at HKUST" ──
             planning_triggers = [
@@ -670,16 +767,28 @@ RESPONSE RULES:
                     self.conversation_history = self.conversation_history[-8:]
                 return plan_reply
 
-            # ── Chained booking: "after I finish badminton, study at lg3" ──
-            chain_phrases = ["after i finish", "after im done", "after i'm done",
-                             "after that", "when im done", "when i'm done",
-                             "once i finish", "once im done", "after my",
-                             "after playing", "after the game", "after i play",
-                             "then study", "after badminton", "after my game"]
-            wants_study = ("study" in low or "library" in low
+            # ── Chained booking: "study at lg3 after pingpong / after badminton" ──
+            # Fires deterministically (no LLM) whenever the user wants to study
+            # "after/once/then/later" relative to an existing booking today.
+            chain_words = ["after", "once", "then", "afterward", "afterwards",
+                           "later", "when i finish", "when im done", "when i'm done",
+                           "subsequently", "following"]
+            wants_study = ("study" in low or "studdy" in low or "sstudy" in low
+                           or "library" in low
                            or _parse_floor_pref(low) in ("LG1", "LG3", "LG4", "1/F", "LC"))
-            if (any(p in low for p in chain_phrases) and wants_study
-                    and any(b["date"] == now.strftime("%Y-%m-%d") for b in self.my_bookings)):
+            today_str = now.strftime("%Y-%m-%d")
+            has_today_booking = any(b["date"] == today_str for b in self.my_bookings)
+            if (any(w in low for w in chain_words) and wants_study and has_today_booking):
+                # If the chain also names a NEW sport (e.g. "play table tennis, then
+                # study"), book the whole sequence; otherwise just the study.
+                booked_sports = {b.get("sport") for b in self.my_bookings
+                                 if b.get("kind") == "sports" and b["date"] == today_str}
+                new_sports = [sk for sk in self._sports_in_text(low)
+                              if sk not in booked_sports and sk in SPORT_VENUES]
+                if new_sports:
+                    seq = self._handle_chain_sequence(low, now, new_sports)
+                    if seq:
+                        return seq
                 chained = self._handle_chained_study(low, now)
                 if chained:
                     return chained
@@ -760,10 +869,11 @@ RESPONSE RULES:
                     }
                     extra_context += "\n\n[BOOKING DURATION NEEDED]\nAsk: 'How long do you need the room?'"
                 else:
-                    # Check daily slot limit
+                    # Check daily LIBRARY slot limit (sports bookings don't count —
+                    # those are limited separately: 1 slot per sport per day).
                     today_slots = sum(
                         b["num_slots"] for b in self.my_bookings
-                        if b["date"] == req_date
+                        if b["date"] == req_date and b.get("kind") != "sports"
                     )
                     slots_remaining = self.MAX_SLOTS_PER_DAY - today_slots
                     if slots_remaining <= 0:
@@ -858,12 +968,26 @@ RESPONSE RULES:
         if not today_bookings:
             return "You don't have any bookings to change today."
 
-        # Pick which booking: match an explicitly named existing room, else most recent
-        target = today_bookings[-1]
+        # Pick which booking to change:
+        #  1) an explicitly named existing room id,
+        #  2) a library booking if they said "study"/"library"/a floor,
+        #  3) the sport they named,
+        #  4) otherwise the most recent booking.
+        target = None
         for b in today_bookings:
             if b["room_id"].lower() in low:
                 target = b
                 break
+        if target is None and ("study" in low or "library" in low
+                               or "study room" in low or _parse_floor_pref(low)):
+            target = next((b for b in reversed(today_bookings)
+                           if b.get("kind") != "sports"), None)
+        if target is None:
+            named = self._sports_in_text(low)
+            target = next((b for b in reversed(today_bookings)
+                           if b.get("kind") == "sports" and b.get("sport") in named), None)
+        if target is None:
+            target = today_bookings[-1]
 
         # Sports bookings aren't editable in place — cancel and rebook instead
         if target.get("kind") == "sports":
@@ -964,6 +1088,30 @@ RESPONSE RULES:
             or re.search(r'\b\d{1,2}\s*(?:-|–|to)\s*\d{1,2}\b', low)
             or re.search(r'(?:from|at|until|till)\s+\d', low)
         )
+
+    @staticmethod
+    def _sports_in_text(low: str) -> set:
+        """
+        All canonical sport keys named in the text. Longest alias wins per span — e.g.
+        "table tennis" registers table_tennis only, not also tennis (its substring).
+        """
+        found = set()
+        work = low
+        for alias in sorted(SPORT_ALIASES, key=len, reverse=True):
+            if alias in work:
+                found.add(SPORT_ALIASES[alias])
+                work = work.replace(alias, " " * len(alias))  # mask so substrings don't re-match
+        return found
+
+    @staticmethod
+    def _booking_matches(b: dict, low: str) -> bool:
+        """True if the message names this booking (by room id, or by its sport)."""
+        if b["room_id"].lower() in low:
+            return True
+        bsport = b.get("sport")
+        if bsport and any(a in low for a, k in SPORT_ALIASES.items() if k == bsport):
+            return True
+        return False
 
     @staticmethod
     def _matches(low: str, words: set) -> bool:
@@ -1082,17 +1230,21 @@ RESPONSE RULES:
                         f"🏃 **{label}** is at **{fac['name']}** ({fac['location']}) — "
                         f"{fac['note']}. No booking needed, just turn up when you arrive.")
 
+            existing = self._sport_booked_today(sport, date_str)
+            if existing:
+                return (f"{bus_line}\n\nYou already have a {label} booking today "
+                        f"({existing['room_id']} {existing['start']}–{existing['end']}). "
+                        f"It's one slot per sport per day — cancel that first to rebook {label}.")
+
             if explicit:
                 sp_h = explicit[0] + (1 if explicit[1] >= 30 else 0)
             else:
                 # Round arrival UP to the next bookable 1-hour slot
                 sp_h = arrival.hour + (1 if arrival.minute > 0 else 0)
 
-            booked = {b.get("fac_id") for b in self.my_bookings
-                      if b.get("kind") == "sports" and b["date"] == date_str}
             pref_fac = match_venue_hint(sport, low)
             result = find_available_venue(date_str, sport, sp_h,
-                                          exclude=booked, preferred_facility=pref_fac)
+                                          preferred_facility=pref_fac)
 
             arr_note = (f" ETA campus ~{arrival.hour:02d}:{arrival.minute:02d}"
                         f" → first slot {sp_h:02d}:00." if not explicit else "")
@@ -1191,17 +1343,72 @@ RESPONSE RULES:
             res = find_available_venue(date_str, sport, 12)
             return format_venue_recommendation(res, date_str, sport)
 
-        # Need an explicit time for a 1-hour slot
-        if not self._message_has_time(low) and "now" not in low:
+        # Need an explicit time for a 1-hour slot — offer the free slots to pick from
+        if (not self._message_has_time(low) and "now" not in low) or not _parse_time_str(low):
             self._waiting_sports_time = {"sport": sport, "date": date_str}
+            opts = self._sport_time_options(sport, date_str, now)
+            if opts:
+                return (f"What time would you like to play {label}? Free 1-hour slots today:\n"
+                        + "\n".join(f"• {o}" for o in opts)
+                        + "\n\nJust tell me a time.")
             return f"What time would you like to play {label}? Courts run in 1-hour slots."
 
         t = _parse_time_str(low)
-        if not t:
-            self._waiting_sports_time = {"sport": sport, "date": date_str}
-            return f"What time would you like to play {label}? Courts run in 1-hour slots."
-
         return self._do_sports_search(sport, date_str, t[0], t[1], match_venue_hint(sport, low))
+
+    def _sport_time_options(self, sport: str, date_str: str, now: datetime, limit: int = 5) -> list:
+        """List the next few free 1-hour slots for a sport, with the least-busy venue."""
+        out = []
+        for h in range(max(now.hour, 7), 23):
+            res = find_available_venue(date_str, sport, h)
+            if res.get("status") == "ok":
+                out.append(f"{h:02d}:00–{h + 1:02d}:00 — {res['facility_info']['name']} "
+                           f"({res['free']} free)")
+                if len(out) >= limit:
+                    break
+        return out
+
+    def _try_sport_swap(self, low: str, now: datetime) -> Optional[str]:
+        """
+        "Instead of table tennis, I'll play basketball" → cancel the table-tennis
+        booking and offer basketball at the SAME time. Returns a reply, or None to
+        fall through. Verifies the new sport is free before cancelling anything.
+        """
+        if not any(w in low for w in ["instead", "rather than", "replace", "swap", "switch", "change"]):
+            return None
+        date_str = now.strftime("%Y-%m-%d")
+        today = [b for b in self.my_bookings if b["date"] == date_str]
+        if not today:
+            return None
+        named = self._sports_in_text(low)
+        if not named:
+            return None
+        booked_sports = {b.get("sport") for b in today if b.get("kind") == "sports"}
+        target = next((b for b in today if b.get("kind") == "sports"
+                       and b.get("sport") in named), None)
+        new_sport = next((s for s in named if s not in booked_sports and s in SPORT_VENUES), None)
+        if not target or not new_sport:
+            return None
+
+        hour = int(target["start"][:2])
+        pref = match_venue_hint(new_sport, low)
+        label = SPORT_LABELS.get(new_sport, new_sport.title())
+        # Verify availability BEFORE cancelling, so a swap never loses both bookings.
+        if find_available_venue(date_str, new_sport, hour, preferred_facility=pref)["status"] != "ok":
+            return (f"{label} isn't free at {hour:02d}:00, so I kept your "
+                    f"{target['room_id']} booking ({target['start']}–{target['end']}) as is.")
+
+        from db import cancel_booking as db_cancel
+        db_cancel(target["ref"])
+        self.my_bookings = [x for x in self.my_bookings if x["ref"] != target["ref"]]
+        search = self._do_sports_search(new_sport, date_str, hour, 0, pref)
+        return (f"✅ Cancelled {target['room_id']} ({target['start']}–{target['end']}).\n\n{search}")
+
+    def _sport_booked_today(self, sport: str, date_str: str) -> Optional[dict]:
+        """Return the user's existing booking for this sport today, if any (1/sport/day)."""
+        return next((b for b in self.my_bookings
+                     if b.get("kind") == "sports" and b["date"] == date_str
+                     and b.get("sport") == sport), None)
 
     def _repick_sport_venue(self, ps: dict, hint: str) -> Optional[str]:
         """Switch a pending sports booking to a specific venue the user named, same time."""
@@ -1228,16 +1435,16 @@ RESPONSE RULES:
             hour += 1  # 1-hour slots — round up to the next hour
         label = SPORT_LABELS.get(sport, sport.title())
 
-        # 1 slot per facility per day — exclude facilities the user already booked today
-        booked = {b.get("fac_id") for b in self.my_bookings
-                  if b.get("kind") == "sports" and b["date"] == date_str}
-        all_venue_ids = {v["id"] for v in SPORT_VENUES.get(sport, [])}
-        if all_venue_ids and all_venue_ids <= booked:
+        # 1 booking per SPORT per day (all venues of a sport share the quota, e.g.
+        # both soccer pitches count as one football booking).
+        existing = self._sport_booked_today(sport, date_str)
+        if existing:
             self.pending_sports = None
-            return (f"You've already used today's booking for every {label} venue "
-                    f"(1 slot per facility per day). Try another day or sport.")
+            return (f"You already have a {label} booking today — {existing['room_id']} "
+                    f"{existing['start']}–{existing['end']}. It's one slot per sport per day, "
+                    f"so cancel that first if you'd like a different {label} slot.")
 
-        result = find_available_venue(date_str, sport, hour, exclude=booked,
+        result = find_available_venue(date_str, sport, hour,
                                       preferred_facility=preferred_facility)
         if result["status"] == "ok":
             self.pending_sports = {
@@ -1274,6 +1481,347 @@ RESPONSE RULES:
         self.pending_sports = None
         return format_venue_recommendation(result, date_str, sport)
 
+    def _parse_study_duration(self, low: str) -> int:
+        """Library duration → number of 30-min slots. Handles 'an hour', '90 min', etc."""
+        m = re.search(r'(\d+)\s*hour', low)
+        if m:
+            return max(1, min(self.MAX_SLOTS_PER_DAY, int(m.group(1)) * 2))
+        mm = re.search(r'(\d+)\s*(?:min|mins|minutes)', low)
+        if mm:
+            return max(1, min(self.MAX_SLOTS_PER_DAY, round(int(mm.group(1)) / 30)))
+        if "half an hour" in low or "half hour" in low:
+            return 1
+        if re.search(r'\b(an|a|one)\s+hour\b', low):
+            return 2  # 1 hour
+        if re.search(r'\b(two|2)\s+hours?\b', low):
+            return 4
+        return 4  # default 2 hours
+
+    def _handle_chain_sequence(self, low: str, now: datetime, new_sports: list) -> Optional[str]:
+        """
+        Book a whole sequence in one go, e.g. "after badminton, play table tennis,
+        then study 1h at lg3" → table tennis right after badminton, then LG3 study
+        right after table tennis. Deterministic; sets _pending_multi for confirmation.
+        """
+        date_str = now.strftime("%Y-%m-%d")
+        today = [b for b in self.my_bookings if b["date"] == date_str]
+        if not today:
+            return None
+
+        anchor = max(today, key=lambda b: b["end"])
+        cur_h = int(anchor["end"][:2])
+        cur_m = 0 if int(anchor["end"][3:]) < 30 else 30
+
+        # Order the new activities by where they appear in the sentence.
+        items = []  # (position, kind, payload)
+        for sk in new_sports:
+            pos = min((low.find(a) for a, k in SPORT_ALIASES.items()
+                       if k == sk and a in low), default=10 ** 9)
+            items.append((pos, "sport", sk))
+        if "study" in low or "studdy" in low or "sstudy" in low or "library" in low \
+                or _parse_floor_pref(low):
+            spos = low.find("study")
+            if spos < 0:
+                spos = low.find("library")
+            if spos < 0:
+                fp = (_parse_floor_pref(low) or "").lower()
+                spos = low.find(fp) if fp else 10 ** 9
+            items.append((spos, "study", _parse_floor_pref(low)))
+        items.sort(key=lambda x: x[0])
+
+        anchor_fac = anchor.get("fac_id")
+        plan = []
+        notes = []
+        lib_used = sum(b["num_slots"] for b in today if b.get("kind") != "sports")
+        plan_sports = set()
+        for _pos, kind, payload in items:
+            if cur_h >= 23:
+                break
+            if kind == "sport":
+                if payload in plan_sports:
+                    continue  # one slot per sport per day
+                label = SPORT_LABELS.get(payload, payload.title())
+                pref = self._sport_venue_pref(payload, low, anchor_fac)
+                if pref:
+                    # Explicit venue choice → honor it strictly; never substitute.
+                    courts = next((v["courts"] for v in SPORT_VENUES.get(payload, [])
+                                   if v["id"] == pref), None)
+                    chosen_h = next((h for h in range(cur_h, min(cur_h + 5, 23))
+                                     if courts and free_courts(date_str, pref, payload, courts, h) > 0), None)
+                    if chosen_h is None:
+                        notes.append(f"⚠️ {FACILITIES[pref]['name']} has no {label} court free "
+                                     f"around {cur_h:02d}:00, so I left {label} out — "
+                                     f"book it separately or pick another venue.")
+                        continue
+                    item = {"kind": "sports", "sport": payload, "facility": pref,
+                            "label": FACILITIES[pref]["name"], "date": date_str,
+                            "hour": chosen_h, "pref_facility": pref}
+                else:
+                    chosen_h = next((h for h in range(cur_h, min(cur_h + 5, 23))
+                                     if find_available_venue(date_str, payload, h)["status"] == "ok"), None)
+                    if chosen_h is None:
+                        continue
+                    res = find_available_venue(date_str, payload, chosen_h)
+                    item = {"kind": "sports", "sport": payload, "facility": res["facility"],
+                            "label": FACILITIES[res["facility"]]["name"], "date": date_str,
+                            "hour": chosen_h}
+                plan.append(item)
+                plan_sports.add(payload)
+                cur_h, cur_m = chosen_h + 1, 0
+            else:  # study
+                remaining = self.MAX_SLOTS_PER_DAY - lib_used
+                if remaining <= 0:
+                    continue
+                n = min(self._parse_study_duration(low), remaining)
+                res = find_best_room(date_str, cur_h, cur_m, n, _parse_capacity(low),
+                                     preferred_floor=payload)
+                if not res.get("found"):
+                    continue
+                plan.append({"kind": "library", "room_id": res["room_id"], "date": date_str,
+                             "hour": cur_h, "minute": cur_m, "num_slots": n,
+                             "floor": res["floor"], "capacity": res["capacity"],
+                             "type": res["room_type"]})
+                lib_used += n
+                tot = cur_m + n * 30
+                cur_h, cur_m = cur_h + tot // 60, tot % 60
+
+        if not plan:
+            # Nothing could be scheduled — surface any venue note so the user knows why.
+            return "\n".join(notes) if notes else None
+        self._pending_multi = {"plan": plan, "anchor_label": anchor["room_id"],
+                               "anchor_end": anchor["end"], "anchor_fac": anchor_fac}
+        body = self._format_multi_plan(plan, anchor["room_id"], anchor["end"])
+        return ("\n".join(notes) + "\n\n" + body) if notes else body
+
+    def _sport_venue_pref(self, sport: str, low: str, anchor_fac: Optional[str]) -> Optional[str]:
+        """Resolve a venue preference for a sport: an explicit hint, or 'same place'
+        meaning the anchor booking's venue (if it hosts that sport)."""
+        hint = match_venue_hint(sport, low)
+        if hint:
+            return hint
+        if anchor_fac and any(p in low for p in
+                              ["same place", "same venue", "same spot", "same hall",
+                               "same court", "same building"]):
+            if any(v["id"] == anchor_fac for v in SPORT_VENUES.get(sport, [])):
+                return anchor_fac
+        return None
+
+    def _revise_multi(self, low: str) -> Optional[str]:
+        """
+        The user tweaked attribute(s) on a pending multi-plan and the rest should be
+        preserved. Supports:
+          • sport venue   ("basketball at the sports hall")
+          • study floor   ("make the study lg4")
+          • study duration("make the study 1 hour instead")
+          • an item's time("start the study at 6", "basketball at 5 instead")
+        Time/duration changes re-flow the plan so items stay back-to-back.
+        Returns the re-presented plan, or None if nothing matched.
+        """
+        ctx = self._pending_multi or {}
+        work = [dict(p) for p in (ctx.get("plan") or [])]
+        if not work:
+            return None
+        anchor_fac = ctx.get("anchor_fac")
+        changed = False
+        need_reflow = False
+
+        # 0) Swap the order/times of two items ("swap the study and basketball times")
+        if any(w in low for w in ["swap", "switch"]):
+            def _label_pos(it):
+                if it["kind"] == "library":
+                    return low.find("study") if "study" in low else low.find("library")
+                aliases = [a for a, k in SPORT_ALIASES.items() if k == it.get("sport") and a in low]
+                return min((low.find(a) for a in aliases), default=-1)
+            referenced = sorted((( _label_pos(it), idx) for idx, it in enumerate(work)
+                                 if _label_pos(it) >= 0), key=lambda x: x[0])
+            if len(referenced) >= 2:
+                i, j = referenced[0][1], referenced[1][1]
+                work[i], work[j] = work[j], work[i]
+                changed = True
+                need_reflow = True
+
+        # 1) Sport venue (lock it — it was the user's explicit choice)
+        for sk in self._sports_in_text(low):
+            pref = self._sport_venue_pref(sk, low, anchor_fac)
+            if not pref:
+                continue
+            for item in work:
+                if item["kind"] == "sports" and item["sport"] == sk and item["facility"] != pref:
+                    courts = next((v["courts"] for v in SPORT_VENUES.get(sk, [])
+                                   if v["id"] == pref), None)
+                    if courts and free_courts(item["date"], pref, sk, courts, item["hour"]) > 0:
+                        item["facility"] = pref
+                        item["label"] = FACILITIES[pref]["name"]
+                        item["pref_facility"] = pref
+                        changed = True
+                    else:
+                        return (f"{FACILITIES[pref]['name']} has no free courts at "
+                                f"{item['hour']:02d}:00, so I kept {item['label']}. "
+                                f"Want a different time or venue?")
+
+        # 2) Study floor (in place, same time)
+        floor = _parse_floor_pref(low)
+        if floor:
+            for item in work:
+                if item["kind"] == "library" and item["floor"] != floor:
+                    item["floor"] = floor      # actual room re-picked in re-flow / below
+                    changed = True
+                    need_reflow = True
+
+        # 3) Study duration ("make the study 1 hour")
+        has_dur = bool(re.search(r'\d+\s*hour', low) or re.search(r'\d+\s*(?:min|mins|minutes)', low)
+                       or re.search(r'\b(an|a|one|two)\s+hours?\b', low)
+                       or "half an hour" in low or "half hour" in low)
+        if has_dur:
+            n = self._parse_study_duration(low)
+            for item in work:
+                if item["kind"] == "library" and item["num_slots"] != n:
+                    item["num_slots"] = n
+                    changed = True
+                    need_reflow = True
+
+        # 4) Explicit time on an item ("start study at 6", "basketball at 5")
+        if self._message_has_time(low):
+            t = _parse_time_str(low)
+            if t:
+                named = self._sports_in_text(low)
+                target = None
+                for item in work:
+                    if item["kind"] == "sports" and item["sport"] in named:
+                        target = item
+                        break
+                if target is None:
+                    target = next((it for it in work if it["kind"] == "library"), None)
+                if target is not None and target.get("hour") != t[0]:
+                    target["_forced"] = (t[0], 0 if target["kind"] == "sports"
+                                         else (30 if t[1] >= 30 else 0))
+                    changed = True
+                    need_reflow = True
+
+        if not changed:
+            return None
+
+        if need_reflow:
+            sh, sm = int(ctx["anchor_end"][:2]), int(ctx["anchor_end"][3:])
+            new_plan, err = self._reflow(work, sh, sm)
+            if err:
+                return f"{err} Your current plan is unchanged."
+            work = new_plan
+
+        self._pending_multi["plan"] = work
+        return self._format_multi_plan(work, ctx["anchor_label"], ctx["anchor_end"])
+
+    def _reflow(self, plan: list, start_h: int, start_m: int):
+        """
+        Recompute every item's time sequentially from (start_h, start_m), keeping items
+        back-to-back and preferring each item's current venue/floor. An item carrying a
+        '_forced' (h, m) jumps the cursor to that time first. Returns (new_plan, None)
+        or (None, error_message) if something can't be placed.
+        """
+        cur_h, cur_m = start_h, start_m
+        out = []
+        for item in plan:
+            it = dict(item)
+            forced = it.pop("_forced", None)
+            if forced:
+                cur_h, cur_m = forced
+            if cur_h >= 23:
+                return None, "That runs past closing time."
+            if it["kind"] == "sports":
+                cur_m = 0  # 1-hour slots sit on the hour
+                hours = [cur_h] if forced else list(range(cur_h, min(cur_h + 5, 23)))
+                locked = it.get("pref_facility")
+                if locked:
+                    # User explicitly chose this venue — never silently substitute.
+                    courts = next((v["courts"] for v in SPORT_VENUES.get(it["sport"], [])
+                                   if v["id"] == locked), None)
+                    chosen = next((h for h in hours if courts
+                                   and free_courts(it["date"], locked, it["sport"], courts, h) > 0), None)
+                    if chosen is None:
+                        return None, (f"{FACILITIES[locked]['name']} has no "
+                                      f"{SPORT_LABELS.get(it['sport'], it['sport'].title())} court free "
+                                      f"around {cur_h:02d}:00.")
+                    it["facility"], it["label"] = locked, FACILITIES[locked]["name"]
+                    it["hour"] = chosen
+                    cur_h, cur_m = chosen + 1, 0
+                else:
+                    chosen = next((h for h in hours
+                                   if find_available_venue(it["date"], it["sport"], h,
+                                                           preferred_facility=it["facility"])["status"] == "ok"), None)
+                    if chosen is None:
+                        return None, (f"{SPORT_LABELS.get(it['sport'], it['sport'].title())} "
+                                      f"isn't free around {cur_h:02d}:00.")
+                    res = find_available_venue(it["date"], it["sport"], chosen,
+                                               preferred_facility=it["facility"])
+                    it["facility"] = res["facility"]
+                    it["label"] = FACILITIES[res["facility"]]["name"]
+                    it["hour"] = chosen
+                    cur_h, cur_m = chosen + 1, 0
+            else:
+                res = find_best_room(it["date"], cur_h, cur_m, it["num_slots"], 1,
+                                     preferred_floor=it.get("floor"))
+                if not res.get("found"):
+                    return None, (f"No {it.get('floor') or 'study'} room is free for "
+                                  f"{it['num_slots'] * 30} min at {cur_h:02d}:{cur_m:02d}.")
+                it.update({"room_id": res["room_id"], "floor": res["floor"],
+                           "capacity": res["capacity"], "type": res["room_type"],
+                           "hour": cur_h, "minute": cur_m})
+                tot = cur_m + it["num_slots"] * 30
+                cur_h, cur_m = cur_h + tot // 60, tot % 60
+            out.append(it)
+        return out, None
+
+    def _format_multi_plan(self, plan: list, anchor_label: str, anchor_end: str) -> str:
+        lines = [f"Here's your plan after **{anchor_label}** (ends {anchor_end}):", ""]
+        for i, p in enumerate(plan, 1):
+            if p["kind"] == "sports":
+                lines.append(f"{i}. 🏸 {SPORT_LABELS.get(p['sport'], p['sport'].title())} — "
+                             f"{p['label']} {p['hour']:02d}:00–{p['hour'] + 1:02d}:00")
+            else:
+                eh = p["hour"] + (p["minute"] + p["num_slots"] * 30) // 60
+                em = (p["minute"] + p["num_slots"] * 30) % 60
+                lines.append(f"{i}. 📚 {p['room_id']} ({p['floor']}, seats {p['capacity']}) "
+                             f"{p['hour']:02d}:{p['minute']:02d}–{eh:02d}:{em:02d}")
+        lines.append("")
+        lines.append("Shall I book all of these?")
+        return "\n".join(lines)
+
+    def _book_multi(self) -> str:
+        """Book every item in the pending multi-plan. Deterministic — no LLM."""
+        plan = (self._pending_multi or {}).get("plan", [])
+        self._pending_multi = None
+        booked, failed = [], []
+        for p in plan:
+            if p["kind"] == "sports":
+                b = book_facility(p["date"], p["facility"], p["hour"], p["sport"])
+                if b["success"]:
+                    self.my_bookings.append({
+                        "ref": b["booking_ref"], "room_id": b["name"], "fac_id": p["facility"],
+                        "sport": p["sport"], "date": b["date"], "start": b["start"],
+                        "end": b["end"], "num_slots": 1, "kind": "sports",
+                    })
+                    booked.append((f"{SPORT_LABELS.get(p['sport'], p['sport'].title())} · {b['name']}",
+                                   b["start"], b["end"], b["booking_ref"]))
+                else:
+                    failed.append((p.get("label", p["sport"]), b["error"]))
+            else:
+                b = book_room(p["date"], p["room_id"], p["hour"], p["minute"], p["num_slots"])
+                if b["success"]:
+                    self.my_bookings.append({
+                        "ref": b["booking_ref"], "room_id": b["room_id"], "date": b["date"],
+                        "start": b["start"], "end": b["end"], "num_slots": p["num_slots"],
+                    })
+                    booked.append((b["room_id"], b["start"], b["end"], b["booking_ref"]))
+                else:
+                    failed.append((p["room_id"], b["error"]))
+
+        lines = ["✅ All booked!" if not failed else "Booked what I could:", ""]
+        for name, s, e, ref in booked:
+            lines.append(f"• {name} {s}–{e}  ·  {ref}")
+        for name, err in failed:
+            lines.append(f"• ⚠️ {name}: {err}")
+        return "\n".join(lines)
+
     def _handle_chained_study(self, low: str, now: datetime) -> Optional[str]:
         """
         "After I finish badminton, study at lg3 for 2 hours" → book a study room
@@ -1285,26 +1833,23 @@ RESPONSE RULES:
         if not today:
             return None
 
-        # Anchor = the booking we chain after. Prefer a sports booking if a sport is
-        # named (e.g. "after badminton"), else the latest-ending booking today.
+        # Anchor = the booking we chain after. If a sport is named (e.g. "after
+        # pingpong"), anchor on THAT sport's booking; else any sports booking; else
+        # the latest-ending booking today.
         sport = resolve_sport(low)
         anchor = None
         if sport:
-            anchor = next((b for b in reversed(today) if b.get("kind") == "sports"), None)
+            anchor = next((b for b in reversed(today)
+                           if b.get("kind") == "sports" and b.get("sport") == sport), None)
+            if anchor is None:
+                anchor = next((b for b in reversed(today) if b.get("kind") == "sports"), None)
         if anchor is None:
             anchor = max(today, key=lambda b: b["end"])
 
         start_h = int(anchor["end"][:2])
         start_m = 0 if int(anchor["end"][3:]) < 30 else 30
 
-        dur_h = re.search(r'(\d+)\s*hour', low)
-        dur_m = re.search(r'(\d+)\s*(?:min|mins|minutes)', low)
-        if dur_h:
-            num_slots = min(self.MAX_SLOTS_PER_DAY, int(dur_h.group(1)) * 2)
-        elif dur_m:
-            num_slots = max(1, min(self.MAX_SLOTS_PER_DAY, round(int(dur_m.group(1)) / 30)))
-        else:
-            num_slots = 4  # default 2 hours
+        num_slots = self._parse_study_duration(low)
 
         # Library daily slot limit (sports bookings don't count)
         used = sum(b["num_slots"] for b in today if b.get("kind") != "sports")
@@ -1450,12 +1995,30 @@ RESPONSE RULES:
         messages = [{"role": "system", "content": self.AGENT_PROMPT}] + self.conversation_history
 
         t0 = time.time()
-        response = self.client.chat.completions.create(
-            model=self.deployment,
-            messages=messages,
-            max_tokens=600,
-            timeout=25,
-        )
+        # Run the (blocking) SDK call off the event loop and bound it with a hard
+        # timeout, so a slow/failing Azure auth or network can never freeze the bot.
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.chat.completions.create,
+                    model=self.deployment,
+                    messages=messages,
+                    max_tokens=600,
+                    timeout=25,
+                ),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            logger.error("Model call timed out after 30s")
+            self.conversation_history.pop()  # drop the unanswered user turn
+            return ("⏳ The AI model didn't respond in time — this is usually an Azure "
+                    "auth/network issue. Tip: set AZURE_OPENAI_API_KEY in .env for instant, "
+                    "reliable responses, then restart.")
+        except Exception as e:
+            logger.error(f"Model call failed: {e}")
+            self.conversation_history.pop()
+            return (f"⚠️ I couldn't reach the AI model ({type(e).__name__}). "
+                    f"If this keeps happening, set AZURE_OPENAI_API_KEY in .env and restart.")
         logger.info(f"Model {time.time()-t0:.2f}s tokens={response.usage.prompt_tokens}")
 
         reply = response.choices[0].message.content
@@ -1485,5 +2048,6 @@ RESPONSE RULES:
         self._pending_edit = None
         self.pending_sports = None
         self._waiting_sports_time = None
+        self._pending_multi = None
         self._plan_ctx = None
         logger.info("Cleanup done")

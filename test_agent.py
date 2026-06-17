@@ -509,8 +509,11 @@ async def main():
     r.agent._plan_ctx = None
     reply = await r.say("im in north point, going to ust to play table tennis. "
                         "book me a slot when i arrive in the multi purpose room")
-    r.check("picked the multi-purpose table-tennis venue (TST)",
-            r.agent.pending_sports and r.agent.pending_sports["facility"] == "TT-TST")
+    fac = (r.agent.pending_sports or {}).get("facility")
+    # Either the multi-purpose room is picked, or (if it's full at the arrival hour)
+    # the fallback is explicitly explained — never a silent substitution.
+    r.check("named venue honored, or fallback explained (never silent)",
+            fac == "TT-TST" or ("is full at" in reply and r.agent.pending_sports is not None))
 
     print("\n" + "=" * 70)
     print("TEST 27 — A word containing 'no' ('north') does NOT false-cancel")
@@ -1003,6 +1006,32 @@ async def main():
     r.check("study now on LG1",
             any(b["room_id"].startswith("LG1-R") for b in r.agent.my_bookings))
     r.check("badminton untouched", any(b.get("sport") == "badminton" for b in r.agent.my_bookings))
+
+    print("\n" + "=" * 70)
+    print("TEST 47 — Edit a SPORTS booking's time in place (atomic)")
+    print("=" * 70)
+    reset_db()
+    r.agent.my_bookings = []
+    r.agent.pending_sports = None
+    r.agent.pending_booking = None
+    r.agent._pending_edit = None
+    hrs = [h for h in range(9, 21)
+           if sports_client.find_available_venue(DATE, "badminton", h)["status"] == "ok"]
+    r.check("two free badminton hours exist", len(hrs) >= 2)
+    h0, h1 = hrs[0], hrs[1]
+    await r.say(f"book badminton at {h0}:00")
+    await r.say("yes")
+    old_fac = r.agent.my_bookings[0]["fac_id"]
+    reply = await r.say(f"change my badminton to {h1}:00")
+    r.check("sports edit proposed (not 'cancel + rebook')", "can't be moved" not in reply.lower())
+    r.check("pending edit is a sports edit",
+            r.agent._pending_edit is not None and r.agent._pending_edit.get("kind") == "sports")
+    r.check("edit targets the new hour", r.agent._pending_edit and r.agent._pending_edit["hour"] == h1)
+    reply = await r.say("yes")
+    r.check("edit applied", "Changed" in reply)
+    r.check("still one booking", len(r.agent.my_bookings) == 1)
+    r.check("booking moved to the new hour", r.agent.my_bookings[0]["start"] == f"{h1:02d}:00")
+    r.check("old slot released in db", not db.is_booked(DATE, old_fac, h0, 0))
 
     # ── Summary ──────────────────────────────────────────────────────────────
     reset_db()

@@ -681,8 +681,10 @@ RESPONSE RULES:
                                   for b in today_bk)
             pref_edit = (any(w in low for w in ["prefer", "rather", "replace", "instead"])
                          and ((wants_lib_change and has_lib) or named_sports_bk))
+            # "change/move/reschedule my badminton to 5" — edit a named sport booking
+            edits_named_sport = any(v in low for v in edit_verbs) and named_sports_bk
 
-            is_edit = is_edit_explicit or pref_edit
+            is_edit = is_edit_explicit or pref_edit or edits_named_sport
             is_cancel = "cancel" in low and not is_edit
             is_my_bookings = (not is_edit and not is_cancel) and any(
                 k in low for k in ["my booking", "my bookings", "show booking", "show my",
@@ -989,10 +991,9 @@ RESPONSE RULES:
         if target is None:
             target = today_bookings[-1]
 
-        # Sports bookings aren't editable in place — cancel and rebook instead
+        # Sports bookings: edit in place (new time and/or venue), atomically.
         if target.get("kind") == "sports":
-            return (f"To change your {target['room_id']} booking ({target['start']}–{target['end']}), "
-                    f"cancel it first then book a new slot — sports slots can't be moved in place.")
+            return self._start_sport_edit(target, low)
 
         old_h, old_m = int(target["start"][:2]), int(target["start"][3:])
         old_slots = target["num_slots"]
@@ -1047,11 +1048,77 @@ RESPONSE RULES:
             f"for {new_h:02d}:{new_m:02d}–{end_h:02d}:{end_m:02d}?\n\nReply yes to confirm."
         )
 
+    def _start_sport_edit(self, target: dict, low: str) -> str:
+        """Edit a sports booking in place: new time and/or venue. Sets _pending_edit."""
+        date_str = target["date"]
+        sport = target.get("sport")
+        label = SPORT_LABELS.get(sport, (sport or "").title())
+        old_h = int(target["start"][:2])
+        cur_fac = target.get("fac_id")
+        if not sport or cur_fac is None:
+            return (f"I can't tell which sport {target['room_id']} is — "
+                    f"please cancel it and rebook.")
+
+        # New time?
+        if self._message_has_time(low):
+            t = _parse_time_str(low)
+            new_h = (t[0] + (1 if t[1] >= 30 else 0)) if t else old_h
+        else:
+            new_h = old_h
+
+        # New venue? An explicit venue is honored strictly; otherwise keep the current one.
+        hint = match_venue_hint(sport, low)
+        if hint:
+            courts = next((v["courts"] for v in SPORT_VENUES.get(sport, []) if v["id"] == hint), None)
+            if not courts or free_courts(date_str, hint, sport, courts, new_h) <= 0:
+                return (f"{FACILITIES[hint]['name']} has no {label} court free at {new_h:02d}:00 — "
+                        f"your {target['room_id']} booking ({target['start']}–{target['end']}) is unchanged.")
+            new_fac = hint
+        else:
+            res = find_available_venue(date_str, sport, new_h, preferred_facility=cur_fac)
+            if res["status"] != "ok":
+                return (f"No {label} court is free at {new_h:02d}:00 — your "
+                        f"{target['room_id']} booking ({target['start']}–{target['end']}) is unchanged.")
+            new_fac = res["facility"]
+
+        if new_fac == cur_fac and new_h == old_h:
+            return (f"That's the same as your current booking — {target['room_id']} "
+                    f"{target['start']}–{target['end']}.")
+
+        self._pending_edit = {
+            "kind": "sports", "old_ref": target["ref"], "old_room": target["room_id"],
+            "sport": sport, "facility": new_fac, "date": date_str, "hour": new_h,
+        }
+        new_slot = f"{new_h:02d}:00–{new_h + 1:02d}:00"
+        if new_fac == cur_fac:
+            return (f"Move your {label} booking from {target['start']}–{target['end']} to "
+                    f"**{new_slot}** at {FACILITIES[new_fac]['name']}? Reply yes to confirm.")
+        return (f"Change **{target['room_id']}** ({target['start']}–{target['end']}) → "
+                f"**{FACILITIES[new_fac]['name']}** ({label}) at {new_slot}? Reply yes to confirm.")
+
     def _apply_edit(self) -> str:
         """Book the new room first, then cancel the old one. Deterministic — no LLM."""
         from db import cancel_booking as db_cancel
         ed = self._pending_edit
         self._pending_edit = None
+
+        # ── Sports edit ───────────────────────────────────────────────────────
+        if ed.get("kind") == "sports":
+            booking = book_facility(ed["date"], ed["facility"], ed["hour"], ed["sport"])
+            if not booking["success"]:
+                return (f"Couldn't switch: {booking['error']} "
+                        f"Your original booking {ed['old_room']} is still active.")
+            db_cancel(ed["old_ref"])
+            self.my_bookings = [b for b in self.my_bookings if b["ref"] != ed["old_ref"]]
+            self.my_bookings.append({
+                "ref": booking["booking_ref"], "room_id": booking["name"],
+                "fac_id": ed["facility"], "sport": ed["sport"], "date": booking["date"],
+                "start": booking["start"], "end": booking["end"],
+                "num_slots": 1, "kind": "sports",
+            })
+            return (f"✅ Changed! {ed['old_room']} → **{booking['name']}** "
+                    f"on {booking['date']} from {booking['start']} to {booking['end']}.\n"
+                    f"New reference: {booking['booking_ref']}")
 
         booking = book_room(
             date_str=ed["date"], room_id=ed["room_id"],
@@ -1248,13 +1315,18 @@ RESPONSE RULES:
 
             arr_note = (f" ETA campus ~{arrival.hour:02d}:{arrival.minute:02d}"
                         f" → first slot {sp_h:02d}:00." if not explicit else "")
+            # If the user named a venue we couldn't honor, say so (don't substitute silently).
+            pref_note = ""
+            if pref_fac and result.get("status") == "ok" and result["facility"] != pref_fac:
+                pref_note = (f"\n\n_Heads up: {FACILITIES[pref_fac]['name']} is full at "
+                             f"{sp_h:02d}:00, so here's the next-best option._")
             if result["status"] == "ok":
                 self.pending_sports = {
                     "sport": sport, "facility": result["facility"],
                     "date": date_str, "hour": result["hour"],
                 }
                 rec = format_venue_recommendation(result, date_str, sport)
-                return f"{bus_line}{arr_note}\n\n{rec}\n\nShall I book it?"
+                return f"{bus_line}{arr_note}{pref_note}\n\n{rec}\n\nShall I book it?"
             if result["status"] == "full" and result.get("alt_times"):
                 alt = result["alt_times"][0]
                 fac = FACILITIES[alt["facility"]]
